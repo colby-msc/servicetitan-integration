@@ -289,9 +289,6 @@ def polling_loop():
             print(f"❌ Polling error: {e}")
         time.sleep(POLL_INTERVAL)
 
-# =================== START BACKGROUND THREAD ===================
-threading.Thread(target=polling_loop, daemon=True).start()
-
 # =================== FLASK ENDPOINTS ===================
 @app.route("/health", methods=["GET"])
 def health():
