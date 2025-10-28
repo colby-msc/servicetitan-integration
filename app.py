@@ -226,8 +226,9 @@ def poll_forms(debug=False):
         form_id = s.get("id")
         print(f"\n➡️ Form ID: {form_id}")
 
-        for f in s.get("fields", []):
-            print(f"   Field: {f.get('name')} = {f.get('value')}")
+        # Show all units (for debugging)
+        for unit in s.get("units", []):
+            print(f"   Unit: {unit.get('name')} = {unit.get('value')}")
 
         job_id = next((o.get("id") for o in s.get("owners", []) if o.get("type") == "Job"), None)
         print(f"   Linked Job ID: {job_id}")
@@ -239,8 +240,9 @@ def poll_forms(debug=False):
             print("   ⏭️ Skipping: Already processed")
             continue
 
+        # ✅ Corrected: look in 'units' instead of 'fields'
         materials_text = next(
-            (f.get("value") for f in s.get("fields", []) if "materials used" in f.get("name", "").lower()),
+            (u.get("value") for u in s.get("units", []) if "materials used" in u.get("name", "").lower()),
             None
         )
 
@@ -251,6 +253,7 @@ def poll_forms(debug=False):
             print("   ⚠️ No 'materials used' field found")
 
     return forms
+
 
 def process_form(form):
     form_id, job_id = form["form_id"], form["job_id"]
