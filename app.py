@@ -280,20 +280,62 @@ def run_polling_cycle(debug=False):
     save_processed_forms()
 
 # =================== FLASK ENDPOINT ===================
-@app.route("/poll")
+@app.route("/poll", methods=["GET", "POST"])
 def poll_endpoint():
     secret = request.args.get("secret")
-    debug = request.args.get("debug") == "true"
-
     if secret != POLL_SECRET:
-        return "Unauthorized", 401
+        return jsonify({"error": "Unauthorized"}), 401
+
+    print("🔍 Poll triggered (testing last form only)")
 
     try:
-        run_polling_cycle(debug=debug)
-        return jsonify({"status": "ok"})
+        # =================== FETCH MOST RECENT FORM ===================
+        url = f"https://api-integration.servicetitan.io/forms/v2/tenant/{SERVICETITAN_TENANT_ID}/submissions"
+        headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY}
+        params = {"page": 1, "pageSize": 1, "modifiedOnOrAfter": (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")}  # 30-day lookback for testing
+
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 401:
+            fetch_new_token()
+            headers["Authorization"] = get_token()
+            response = requests.get(url, headers=headers, params=params)
+        if response.status_code != 200:
+            print(f"❌ Failed to fetch forms: {response.status_code}")
+            return jsonify({"status": "error", "message": "Failed to fetch forms"}), 500
+
+        data = response.json().get("data", [])
+        if not data:
+            print("📄 No forms found")
+            return jsonify({"status": "success", "message": "No forms found"}), 200
+
+        # Take the most recent form only
+        form = data[0]
+        form_id = form.get("id")
+        print(f"\n➡️ Most recent Form ID: {form_id}")
+
+        job_id = next((o.get("id") for o in form.get("owners", []) if o.get("type") == "Job"), None)
+        print(f"   Linked Job ID: {job_id}")
+
+        materials_text = next(
+            (u.get("value") for u in form.get("units", []) if u.get("name") and "materials used" in u.get("name").lower()),
+            None
+        )
+
+        if materials_text and materials_text.strip():
+            print(f"   Materials Used:\n{materials_text}")
+            # Parse materials but don't add to invoice for now
+            parsed_materials = parse_materials_text(materials_text)
+            for m in parsed_materials:
+                print(f"   Parsed Material: {m['quantity']} x {m['description']}")
+        else:
+            print("⚠️ No 'materials used' field found")
+
+        return jsonify({"status": "success", "form_id": form_id}), 200
+
     except Exception as e:
-        print(f"❌ Error during polling: {e}")
-        return "Internal Server Error", 500
+        print(f"❌ Polling failed: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 # =================== APP START ===================
 if __name__ == "__main__":
