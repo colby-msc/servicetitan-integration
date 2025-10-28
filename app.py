@@ -304,6 +304,18 @@ def test_matching():
         })
     return jsonify({"results": results})
 
+@app.route("/manual-process", methods=["POST"])
+def manual_process():
+    new_forms = poll_forms()
+    for f in new_forms:
+        process_form(f)
+    return jsonify({"processed": len(new_forms)})
+
+# =================== START POLLING ON FLASK START ===================
+@app.before_first_request
+def start_polling():
+    threading.Thread(target=polling_loop, daemon=True).start()
+
 # =================== MAIN ===================
 if __name__ == "__main__":
     print("🚀 Starting ServiceTitan Form → Invoice Bridge")
@@ -311,5 +323,4 @@ if __name__ == "__main__":
     load_processed_forms()
     if not token_data["access_token"]:
         fetch_new_token()
-    threading.Thread(target=polling_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
