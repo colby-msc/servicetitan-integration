@@ -240,19 +240,22 @@ def poll_forms(debug=False):
             print("   ⏭️ Skipping: Already processed")
             continue
 
-        # ✅ Corrected: look in 'units' instead of 'fields'
-        materials_text = next(
-            (u.get("value") for u in s.get("units", []) if "materials used" in u.get("name", "").lower()),
-            None
-        )
+        # Only look at units, safely handle missing names
+        materials_text = None
+        for u in s.get("units", []):
+            name = u.get("name")
+            if name and "materials used" in name.lower():
+                materials_text = u.get("value")
+                break
 
-        if materials_text and materials_text.strip():
+        if materials_text and str(materials_text).strip():
             forms.append({"form_id": form_id, "job_id": job_id, "materials_text": materials_text})
             print(f"✅ Found materials text for processing")
         else:
             print("   ⚠️ No 'materials used' field found")
 
     return forms
+
 
 
 def process_form(form):
