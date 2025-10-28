@@ -212,19 +212,31 @@ def poll_forms():
 
     forms = []
     for s in response.json().get("data", []):
-        sid, job_id = s.get("id"), s.get("jobId")
+        sid = s.get("id")
+        # Extract job_id from owners array
+        job_id = None
+        for owner in s.get("owners", []):
+            if owner.get("type") == "Job":
+                job_id = owner.get("id")
+                break
+
         if not job_id or sid in processed_forms:
             continue
+
         materials_text = None
+        # Check fields for materials info
         for f in s.get("fields", []):
             name = f.get("name", "").lower()
             if any(k in name for k in ["material", "materials", "part", "used", "installed"]):
                 materials_text = f.get("value", "")
                 break
+
         if materials_text and materials_text.strip():
             forms.append({"form_id": sid, "job_id": job_id, "materials_text": materials_text})
             print(f"✅ Found materials in form {sid} for job {job_id}")
+
     return forms
+
 
 def process_form(form):
     form_id, job_id = form["form_id"], form["job_id"]
