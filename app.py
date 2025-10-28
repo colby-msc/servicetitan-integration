@@ -13,10 +13,10 @@ SERVICETITAN_TENANT_ID = os.getenv("SERVICETITAN_TENANT_ID")
 SERVICETITAN_APP_KEY = os.getenv("SERVICETITAN_APP_KEY")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+POLL_SECRET = os.getenv("POLL_SECRET", "my-secret-key")
 
 TOKEN_FILE = "token_cache.json"
 PROCESSED_FORMS_FILE = "processed_forms.json"
-POLL_INTERVAL = 120  # Not used here, kept for reference
 
 # =================== GLOBAL STATE ===================
 token_data = {"access_token": None, "expires_at": 0}
@@ -32,18 +32,17 @@ def save_token_to_file():
         print(f"⚠️ Could not save token: {e}")
 
 def load_token_from_file():
-    if not os.path.exists(TOKEN_FILE):
-        return
-    try:
-        with open(TOKEN_FILE, "r") as f:
-            data = json.load(f)
-        if time.time() < data.get("expires_at", 0):
-            token_data.update(data)
-            print("✅ Loaded token from cache")
-        else:
-            print("⚠️ Cached token expired")
-    except Exception as e:
-        print(f"⚠️ Could not read cached token: {e}")
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, "r") as f:
+                data = json.load(f)
+            if time.time() < data.get("expires_at", 0):
+                token_data.update(data)
+                print("✅ Loaded token from cache")
+            else:
+                print("⚠️ Cached token expired")
+        except Exception as e:
+            print(f"⚠️ Could not read cached token: {e}")
 
 def fetch_new_token():
     print("🔐 Fetching new ServiceTitan token...")
@@ -230,59 +229,51 @@ def poll_forms():
 def process_form(form):
     form_id, job_id = form["form_id"], form["job_id"]
     if form_id in processed_forms:
-        print(f"⏭️ Already processed {form_id}")
+        print(f"ℹ️ Form {form_id} already processed")
         return
+    materials_list = parse_materials_text(form["materials_text"])
+    materials_pricebook = fetch_materials_pricebook()
+    matched_materials = []
+    for m in materials_list:
+        skuId, name, score = match_material(m["description"], materials_pricebook)
+        if skuId:
+            matched_materials.append({"skuId": skuId, "quantity": m["quantity"], "description": name})
+        else:
+            print(f"⚠️ Could not match '{m['description']}'")
 
     invoice_id = get_invoice_id_from_job(job_id)
-    if not invoice_id:
-        print(f"⚠️ No invoice found for job {job_id}")
-        return
-
-    parsed = parse_materials_text(form["materials_text"])
-    pricebook = fetch_materials_pricebook()
-
-    matched, unmatched = [], []
-    for m in parsed:
-        sku_id, name, score = match_material(m["description"], pricebook)
-        if sku_id:
-            matched.append({"skuId": sku_id, "quantity": m["quantity"], "description": m["description"]})
-        else:
-            unmatched.append(m)
-
-    if matched:
-        success = add_materials_to_invoice(invoice_id, matched)
-        if success:
-            print(f"✅ Form {form_id} processed successfully")
-        else:
-            print(f"❌ Failed to process form {form_id}")
-    if unmatched:
-        print(f"⚠️ Unmatched items in form {form_id}: {unmatched}")
-
-    processed_forms.add(form_id)
-    save_processed_forms()
+    if invoice_id and matched_materials:
+        if add_materials_to_invoice(invoice_id, matched_materials):
+            processed_forms.add(form_id)
+            save_processed_forms()
 
 def run_polling_cycle():
-    load_token_from_file()
     load_processed_forms()
     forms = poll_forms()
-    for f in forms:
-        process_form(f)
-    return {"processed_forms": len(forms)}
+    for form in forms:
+        process_form(form)
 
 # =================== FLASK ENDPOINTS ===================
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"status": "ok", "message": "ServiceTitan materials automation running"}), 200
 
-@app.route("/poll", methods=["POST"])
+@app.route("/poll", methods=["GET", "POST"])
 def poll_endpoint():
+    secret = request.args.get("secret")
+    if secret != POLL_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
     try:
-        result = run_polling_cycle()
-        return jsonify({"status": "ok", "details": result})
+        run_polling_cycle()
+        return jsonify({"status": "success"}), 200
     except Exception as e:
+        print(f"❌ Polling failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# =================== LOCAL RUN ===================
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "healthy"}), 200
+
 if __name__ == "__main__":
-    print("🚀 Starting ServiceTitan Form → Invoice Bridge (local)")
+    load_token_from_file()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
