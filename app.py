@@ -3,7 +3,6 @@ import requests
 import json
 import time
 import os
-import threading
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 
@@ -17,7 +16,7 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
 TOKEN_FILE = "token_cache.json"
 PROCESSED_FORMS_FILE = "processed_forms.json"
-POLL_INTERVAL = 120  # seconds
+POLL_INTERVAL = 120  # Not used here, kept for reference
 
 # =================== GLOBAL STATE ===================
 token_data = {"access_token": None, "expires_at": 0}
@@ -90,7 +89,7 @@ def save_processed_forms():
     except Exception as e:
         print(f"⚠️ Could not save processed forms: {e}")
 
-# =================== PRICEBOOK MATERIALS ===================
+# =================== MATERIALS ===================
 def fetch_materials_pricebook():
     if time.time() - materials_cache["last_updated"] < materials_cache["cache_duration"]:
         return materials_cache["data"]
@@ -213,22 +212,19 @@ def poll_forms():
     forms = []
     for s in response.json().get("data", []):
         sid = s.get("id")
-        job_id = None
-        for owner in s.get("owners", []):
-            if owner.get("type") == "Job":
-                job_id = owner.get("id")
-                break
+        job_id = next((o.get("id") for o in s.get("owners", []) if o.get("type") == "Job"), None)
         if not job_id or sid in processed_forms:
             continue
-        materials_text = None
-        for f in s.get("fields", []):
-            name = f.get("name", "").lower()
-            if "materials used" in name:
-                materials_text = f.get("value", "")
-                break
+
+        materials_text = next(
+            (f.get("value") for f in s.get("fields", []) if "materials used" in f.get("name", "").lower()),
+            None
+        )
+
         if materials_text and materials_text.strip():
             forms.append({"form_id": sid, "job_id": job_id, "materials_text": materials_text})
             print(f"✅ Found materials in form {sid} for job {job_id}")
+
     return forms
 
 def process_form(form):
@@ -249,11 +245,7 @@ def process_form(form):
     for m in parsed:
         sku_id, name, score = match_material(m["description"], pricebook)
         if sku_id:
-            matched.append({
-                "skuId": sku_id,
-                "quantity": m["quantity"],
-                "description": m["description"]
-            })
+            matched.append({"skuId": sku_id, "quantity": m["quantity"], "description": m["description"]})
         else:
             unmatched.append(m)
 
@@ -269,31 +261,28 @@ def process_form(form):
     processed_forms.add(form_id)
     save_processed_forms()
 
-def polling_loop():
+def run_polling_cycle():
     load_token_from_file()
     load_processed_forms()
-    while True:
-        print(f"⏱ Polling thread woke up at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        try:
-            forms = poll_forms()
-            for f in forms:
-                process_form(f)
-        except Exception as e:
-            print(f"❌ Polling error: {e}")
-        time.sleep(POLL_INTERVAL)
+    forms = poll_forms()
+    for f in forms:
+        process_form(f)
+    return {"processed_forms": len(forms)}
 
 # =================== FLASK ENDPOINTS ===================
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
 
-# =================== LOCAL RUN / RENDER WEB SERVICE ===================
+@app.route("/poll", methods=["POST"])
+def poll_endpoint():
+    try:
+        result = run_polling_cycle()
+        return jsonify({"status": "ok", "details": result})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# =================== LOCAL RUN ===================
 if __name__ == "__main__":
     print("🚀 Starting ServiceTitan Form → Invoice Bridge (local)")
-
-    # Start polling in a background daemon thread
-    thread = threading.Thread(target=polling_loop, daemon=True)
-    thread.start()
-
-    # Start Flask app
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
