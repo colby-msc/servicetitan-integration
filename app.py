@@ -213,31 +213,23 @@ def poll_forms():
     forms = []
     for s in response.json().get("data", []):
         sid = s.get("id")
-        # Extract job_id from owners array
         job_id = None
         for owner in s.get("owners", []):
             if owner.get("type") == "Job":
                 job_id = owner.get("id")
                 break
-
         if not job_id or sid in processed_forms:
             continue
-
         materials_text = None
-        # Check fields for materials info
         for f in s.get("fields", []):
             name = f.get("name", "").lower()
             if "materials used" in name:
                 materials_text = f.get("value", "")
                 break
-
-
         if materials_text and materials_text.strip():
             forms.append({"form_id": sid, "job_id": job_id, "materials_text": materials_text})
             print(f"✅ Found materials in form {sid} for job {job_id}")
-
     return forms
-
 
 def process_form(form):
     form_id, job_id = form["form_id"], form["job_id"]
@@ -281,6 +273,7 @@ def polling_loop():
     load_token_from_file()
     load_processed_forms()
     while True:
+        print(f"⏱ Polling thread woke up at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         try:
             forms = poll_forms()
             for f in forms:
@@ -294,7 +287,13 @@ def polling_loop():
 def health():
     return jsonify({"status": "ok"})
 
-# =================== LOCAL RUN ===================
+# =================== LOCAL RUN / RENDER WEB SERVICE ===================
 if __name__ == "__main__":
     print("🚀 Starting ServiceTitan Form → Invoice Bridge (local)")
+
+    # Start polling in a background daemon thread
+    thread = threading.Thread(target=polling_loop, daemon=True)
+    thread.start()
+
+    # Start Flask app
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
