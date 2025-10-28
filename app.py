@@ -237,8 +237,7 @@ def process_form(form):
         print(f"⚠️ No invoice found for job {job_id}")
         return
 
-    materials_text = form["materials_text"]
-    parsed = parse_materials_text(materials_text)
+    parsed = parse_materials_text(form["materials_text"])
     pricebook = fetch_materials_pricebook()
 
     matched, unmatched = [], []
@@ -250,77 +249,42 @@ def process_form(form):
                 "quantity": m["quantity"],
                 "description": m["description"]
             })
-            print(f"✅ Matched '{m['description']}' → '{name}' ({score:.0%})")
         else:
-            unmatched.append(m["description"])
+            unmatched.append(m)
 
     if matched:
         success = add_materials_to_invoice(invoice_id, matched)
         if success:
-            processed_forms.add(form_id)
-            save_processed_forms()
-    else:
-        print(f"⚠️ No materials matched for form {form_id}")
-
+            print(f"✅ Form {form_id} processed successfully")
+        else:
+            print(f"❌ Failed to process form {form_id}")
     if unmatched:
-        print(f"⚠️ Unmatched materials: {', '.join(unmatched)}")
+        print(f"⚠️ Unmatched items in form {form_id}: {unmatched}")
 
-# =================== BACKGROUND POLLING LOOP ===================
+    processed_forms.add(form_id)
+    save_processed_forms()
+
 def polling_loop():
-    print(f"🔄 Polling every {POLL_INTERVAL}s...")
-    while True:
-        try:
-            new_forms = poll_forms()
-            for f in new_forms:
-                process_form(f)
-        except Exception as e:
-            print(f"🔥 Polling error: {e}")
-        time.sleep(POLL_INTERVAL)
-
-# =================== FLASK ROUTES ===================
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({
-        "status": "running",
-        "service": "ServiceTitan Form → Invoice Bridge",
-        "processed_forms": len(processed_forms),
-        "cached_materials": len(materials_cache["data"])
-    })
-
-@app.route("/test-matching", methods=["POST"])
-def test_matching():
-    data = request.get_json()
-    text = data.get("materials_text", "")
-    parsed = parse_materials_text(text)
-    pricebook = fetch_materials_pricebook()
-    results = []
-    for m in parsed:
-        sku, name, score = match_material(m["description"], pricebook)
-        results.append({
-            "input": m["description"],
-            "quantity": m["quantity"],
-            "match": name or "No match",
-            "confidence": f"{score:.0%}"
-        })
-    return jsonify({"results": results})
-
-@app.route("/manual-process", methods=["POST"])
-def manual_process():
-    new_forms = poll_forms()
-    for f in new_forms:
-        process_form(f)
-    return jsonify({"processed": len(new_forms)})
-
-# =================== START POLLING ON FLASK START ===================
-@app.before_first_request
-def start_polling():
-    threading.Thread(target=polling_loop, daemon=True).start()
-
-# =================== MAIN ===================
-if __name__ == "__main__":
-    print("🚀 Starting ServiceTitan Form → Invoice Bridge")
     load_token_from_file()
     load_processed_forms()
-    if not token_data["access_token"]:
-        fetch_new_token()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    while True:
+        try:
+            forms = poll_forms()
+            for f in forms:
+                process_form(f)
+        except Exception as e:
+            print(f"❌ Polling error: {e}")
+        time.sleep(POLL_INTERVAL)
+
+# =================== START BACKGROUND THREAD ===================
+threading.Thread(target=polling_loop, daemon=True).start()
+
+# =================== FLASK ENDPOINTS ===================
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+# =================== LOCAL RUN ===================
+if __name__ == "__main__":
+    print("🚀 Starting ServiceTitan Form → Invoice Bridge (local)")
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
