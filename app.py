@@ -227,9 +227,10 @@ def poll_forms():
         # Check fields for materials info
         for f in s.get("fields", []):
             name = f.get("name", "").lower()
-            if any(k in name for k in ["material", "materials", "part", "used", "installed"]):
+            if "materials used" in name:
                 materials_text = f.get("value", "")
                 break
+
 
         if materials_text and materials_text.strip():
             forms.append({"form_id": sid, "job_id": job_id, "materials_text": materials_text})
