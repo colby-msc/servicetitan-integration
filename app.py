@@ -145,11 +145,16 @@ def parse_materials_text(text):
         line = line.strip()
         if not line:
             continue
-        parts = line.split(None, 1)
-        if len(parts) == 2 and parts[0].isdigit():
-            materials.append({"quantity": int(parts[0]), "description": parts[1]})
-        else:
-            materials.append({"quantity": 1, "description": line})
+        # Allow multiple items separated by commas
+        for part in line.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            pieces = part.split(None, 1)
+            if len(pieces) == 2 and pieces[0].isdigit():
+                materials.append({"quantity": int(pieces[0]), "description": pieces[1]})
+            else:
+                materials.append({"quantity": 1, "description": part})
     return materials
 
 # =================== SERVICE TITAN OPERATIONS ===================
@@ -193,26 +198,45 @@ def add_materials_to_invoice(invoice_id, materials):
     return False
 
 # =================== FORMS POLLING ===================
-def poll_forms():
+def poll_forms(debug=False):
     print("🔍 Checking for new form submissions...")
     url = f"https://api-integration.servicetitan.io/forms/v2/tenant/{SERVICETITAN_TENANT_ID}/submissions"
     headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY}
-    ten_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    params = {"page": 1, "pageSize": 50, "modifiedOnOrAfter": ten_min_ago}
+
+    lookback = timedelta(hours=1) if debug else timedelta(minutes=10)
+    modified_since = (datetime.now(timezone.utc) - lookback).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    params = {"page": 1, "pageSize": 50, "modifiedOnOrAfter": modified_since}
     response = requests.get(url, headers=headers, params=params)
+
     if response.status_code == 401:
         fetch_new_token()
         headers["Authorization"] = get_token()
         response = requests.get(url, headers=headers, params=params)
+
     if response.status_code != 200:
         print(f"❌ Failed to fetch forms: {response.status_code}")
         return []
 
     forms = []
-    for s in response.json().get("data", []):
-        sid = s.get("id")
+    data = response.json().get("data", [])
+    print(f"📄 Fetched {len(data)} forms from API")
+
+    for s in data:
+        form_id = s.get("id")
+        print(f"\n➡️ Form ID: {form_id}")
+
+        for f in s.get("fields", []):
+            print(f"   Field: {f.get('name')} = {f.get('value')}")
+
         job_id = next((o.get("id") for o in s.get("owners", []) if o.get("type") == "Job"), None)
-        if not job_id or sid in processed_forms:
+        print(f"   Linked Job ID: {job_id}")
+
+        if not job_id:
+            print("   ⚠️ Skipping: No job associated")
+            continue
+        if form_id in processed_forms:
+            print("   ⏭️ Skipping: Already processed")
             continue
 
         materials_text = next(
@@ -221,8 +245,10 @@ def poll_forms():
         )
 
         if materials_text and materials_text.strip():
-            forms.append({"form_id": sid, "job_id": job_id, "materials_text": materials_text})
-            print(f"✅ Found materials in form {sid} for job {job_id}")
+            forms.append({"form_id": form_id, "job_id": job_id, "materials_text": materials_text})
+            print(f"✅ Found materials text for processing")
+        else:
+            print("   ⚠️ No 'materials used' field found")
 
     return forms
 
@@ -247,9 +273,9 @@ def process_form(form):
             processed_forms.add(form_id)
             save_processed_forms()
 
-def run_polling_cycle():
+def run_polling_cycle(debug=False):
     load_processed_forms()
-    forms = poll_forms()
+    forms = poll_forms(debug=debug)
     for form in forms:
         process_form(form)
 
@@ -263,8 +289,9 @@ def poll_endpoint():
     secret = request.args.get("secret")
     if secret != POLL_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
+    debug = request.args.get("debug", "false").lower() == "true"
     try:
-        run_polling_cycle()
+        run_polling_cycle(debug=debug)
         return jsonify({"status": "success"}), 200
     except Exception as e:
         print(f"❌ Polling failed: {e}")
