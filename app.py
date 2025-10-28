@@ -3,34 +3,34 @@ import requests
 import json
 import time
 import os
-from difflib import SequenceMatcher
 import threading
+from difflib import SequenceMatcher
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
-# CONFIG
+# =================== CONFIG ===================
 SERVICETITAN_TENANT_ID = os.getenv("SERVICETITAN_TENANT_ID")
 SERVICETITAN_APP_KEY = os.getenv("SERVICETITAN_APP_KEY")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+
 TOKEN_FILE = "token_cache.json"
 PROCESSED_FORMS_FILE = "processed_forms.json"
-POLL_INTERVAL = 120  # Poll every 2 minutes
+POLL_INTERVAL = 120  # seconds
 
-# GLOBAL STATE
+# =================== GLOBAL STATE ===================
 token_data = {"access_token": None, "expires_at": 0}
 materials_cache = {"data": [], "last_updated": 0, "cache_duration": 3600}
 processed_forms = set()
 
-
-# ========== TOKEN MANAGEMENT ==========
+# =================== TOKEN MANAGEMENT ===================
 def save_token_to_file():
     try:
         with open(TOKEN_FILE, "w") as f:
             json.dump(token_data, f)
-        print("💾 Token cached to file.")
     except Exception as e:
-        print("⚠️ Could not save token:", e)
+        print(f"⚠️ Could not save token: {e}")
 
 def load_token_from_file():
     if not os.path.exists(TOKEN_FILE):
@@ -40,13 +40,14 @@ def load_token_from_file():
             data = json.load(f)
         if time.time() < data.get("expires_at", 0):
             token_data.update(data)
-            print("✅ Loaded valid token from cache.")
+            print("✅ Loaded token from cache")
         else:
-            print("⚠️ Cached token expired.")
+            print("⚠️ Cached token expired")
     except Exception as e:
-        print("⚠️ Could not read cached token:", e)
+        print(f"⚠️ Could not read cached token: {e}")
 
 def fetch_new_token():
+    print("🔐 Fetching new ServiceTitan token...")
     url = "https://auth-integration.servicetitan.io/connect/token"
     payload = {
         "grant_type": "client_credentials",
@@ -54,26 +55,24 @@ def fetch_new_token():
         "client_secret": CLIENT_SECRET,
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    print("🔐 Fetching new ServiceTitan token...")
     response = requests.post(url, data=payload, headers=headers)
-    
+
     if response.status_code == 200:
         data = response.json()
         token_data["access_token"] = f"Bearer {data['access_token']}"
         token_data["expires_at"] = time.time() + data.get("expires_in", 900) - 30
         save_token_to_file()
-        print("✅ New token acquired.")
+        print("✅ Token refreshed")
     else:
-        print(f"❌ Token fetch failed: {response.status_code}")
-        raise Exception("Failed to get ServiceTitan token")
+        print(f"❌ Failed to fetch token: {response.status_code} {response.text}")
+        raise Exception("ServiceTitan token fetch failed")
 
 def get_token():
     if not token_data["access_token"] or time.time() > token_data["expires_at"]:
         fetch_new_token()
     return token_data["access_token"]
 
-
-# ========== PROCESSED FORMS TRACKING ==========
+# =================== PROCESSED FORMS ===================
 def load_processed_forms():
     global processed_forms
     if os.path.exists(PROCESSED_FORMS_FILE):
@@ -82,440 +81,235 @@ def load_processed_forms():
                 processed_forms = set(json.load(f))
             print(f"📋 Loaded {len(processed_forms)} processed forms")
         except Exception as e:
-            print("⚠️ Could not load processed forms:", e)
+            print(f"⚠️ Could not load processed forms: {e}")
 
 def save_processed_forms():
     try:
         with open(PROCESSED_FORMS_FILE, "w") as f:
             json.dump(list(processed_forms), f)
     except Exception as e:
-        print("⚠️ Could not save processed forms:", e)
+        print(f"⚠️ Could not save processed forms: {e}")
 
-
-# ========== MATERIALS PRICEBOOK ==========
+# =================== PRICEBOOK MATERIALS ===================
 def fetch_materials_pricebook():
-    """Fetch and cache all materials from pricebook."""
     if time.time() - materials_cache["last_updated"] < materials_cache["cache_duration"]:
-        print("✅ Using cached materials pricebook")
         return materials_cache["data"]
-    
-    print("🔄 Fetching materials pricebook...")
+
+    print("🔄 Fetching materials from pricebook...")
     url = f"https://api-integration.servicetitan.io/pricebook/v2/tenant/{SERVICETITAN_TENANT_ID}/materials"
-    headers = {
-        "Authorization": get_token(),
-        "ST-App-Key": SERVICETITAN_APP_KEY
-    }
-    
+    headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY}
     all_materials = []
     page = 1
-    
+
     while True:
         params = {"page": page, "pageSize": 500}
         response = requests.get(url, headers=headers, params=params)
-        
         if response.status_code == 401:
             fetch_new_token()
             headers["Authorization"] = get_token()
             response = requests.get(url, headers=headers, params=params)
-        
         if response.status_code != 200:
-            print(f"❌ Failed to fetch materials: {response.status_code}")
+            print(f"❌ Error fetching materials: {response.status_code}")
             break
-        
         data = response.json()
-        materials = data.get("data", [])
-        if not materials:
+        items = data.get("data", [])
+        if not items:
             break
-        
-        all_materials.extend(materials)
-        print(f"📦 Page {page}: {len(materials)} materials")
-        
+        all_materials.extend(items)
         if not data.get("hasMore", False):
             break
         page += 1
-    
+
     materials_cache["data"] = all_materials
     materials_cache["last_updated"] = time.time()
     print(f"✅ Cached {len(all_materials)} materials")
     return all_materials
 
-
-# ========== FUZZY MATCHING ==========
-def similarity_score(a, b):
-    """Calculate similarity between two strings (0-1)."""
+# =================== MATCHING HELPERS ===================
+def similarity(a, b):
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-def match_material_to_sku(description, materials_list):
-    """
-    Match material description to SKU from pricebook.
-    Returns (material_id, matched_name, confidence_score)
-    """
-    best_match = None
-    best_score = 0
-    best_name = None
-    
-    desc_clean = description.lower().strip()
-    
-    for material in materials_list:
-        fields_to_check = [
-            material.get("displayName", ""),
-            material.get("description", ""),
-            material.get("code", "")
-        ]
-        
-        for field in fields_to_check:
+def match_material(description, materials):
+    desc = description.lower().strip()
+    best_id, best_name, best_score = None, None, 0
+    for m in materials:
+        for field in [m.get("displayName", ""), m.get("description", ""), m.get("code", "")]:
             if not field:
                 continue
-            
-            score = similarity_score(desc_clean, field)
+            score = similarity(desc, field)
             if score > best_score:
-                best_score = score
-                best_match = material["id"]
-                best_name = material.get("displayName", "")
-    
-    # Only return matches with >60% confidence
-    if best_score > 0.6:
-        return best_match, best_name, best_score
-    
-    return None, None, 0
+                best_score, best_id, best_name = score, m["id"], m.get("displayName", "")
+    return (best_id, best_name, best_score) if best_score > 0.6 else (None, None, 0)
 
-
-def parse_materials_from_text(materials_text):
-    """
-    Parse materials from free-text input.
-    Format: "quantity description" per line
-    Returns [{"quantity": int, "description": str}]
-    """
+def parse_materials_text(text):
     materials = []
-    lines = materials_text.strip().split("\n")
-    
-    for line in lines:
+    for line in text.strip().splitlines():
         line = line.strip()
-        if not line or line.startswith("#") or line.lower().startswith("material"):
+        if not line:
             continue
-        
-        parts = line.split(None, 1)  # Split on first whitespace
-        
-        if len(parts) == 2:
-            qty_str, desc = parts
-            try:
-                qty_str = qty_str.rstrip("-")  # Handle "2-" format
-                quantity = int(qty_str)
-                materials.append({"quantity": quantity, "description": desc})
-            except ValueError:
-                # First part isn't a number, assume quantity 1
-                materials.append({"quantity": 1, "description": line})
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            materials.append({"quantity": int(parts[0]), "description": parts[1]})
         else:
-            # No quantity found, assume 1
             materials.append({"quantity": 1, "description": line})
-    
     return materials
 
-
-# ========== INVOICE OPERATIONS ==========
-def add_materials_to_invoice(invoice_id, materials_to_add):
-    """
-    Add materials to invoice using PATCH endpoint.
-    materials_to_add: [{"skuId": id, "quantity": qty, "description": desc}]
-    """
-    url = f"https://api-integration.servicetitan.io/sales/v2/tenant/{SERVICETITAN_TENANT_ID}/invoices/{invoice_id}"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": get_token(),
-        "ST-App-Key": SERVICETITAN_APP_KEY
-    }
-    
-    items = []
-    for material in materials_to_add:
-        items.append({
-            "skuId": material["skuId"],
-            "quantity": material["quantity"],
-            "description": material["description"]
-        })
-    
-    payload = {"items": items}
-    
-    print(f"📤 Adding {len(items)} materials to invoice {invoice_id}")
-    response = requests.patch(url, headers=headers, json=payload)
-    
-    if response.status_code == 401:
-        fetch_new_token()
-        headers["Authorization"] = get_token()
-        response = requests.patch(url, headers=headers, json=payload)
-    
-    if 200 <= response.status_code < 300:
-        print(f"✅ Materials added to invoice {invoice_id}")
-        return True
-    else:
-        print(f"❌ Failed to add materials: {response.status_code} - {response.text}")
-        return False
-
-
-# ========== JOB & INVOICE OPERATIONS ==========
+# =================== SERVICE TITAN OPERATIONS ===================
 def get_invoice_id_from_job(job_id):
-    """Get the invoice ID associated with a job."""
     url = f"https://api-integration.servicetitan.io/jpm/v2/tenant/{SERVICETITAN_TENANT_ID}/jobs/{job_id}"
-    headers = {
-        "Authorization": get_token(),
-        "ST-App-Key": SERVICETITAN_APP_KEY
-    }
-    
+    headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY}
     response = requests.get(url, headers=headers)
-    
     if response.status_code == 401:
         fetch_new_token()
         headers["Authorization"] = get_token()
         response = requests.get(url, headers=headers)
-    
     if response.status_code == 200:
-        job_data = response.json()
-        invoice_id = job_data.get("invoice", {}).get("id")
-        return invoice_id
-    else:
-        print(f"❌ Failed to get job {job_id}: {response.status_code}")
-        return None
+        job = response.json()
+        invoices = job.get("invoices", [])
+        if invoices:
+            return invoices[0].get("id")
+        return job.get("invoice", {}).get("id")
+    print(f"❌ Failed to get job {job_id}: {response.status_code}")
+    return None
 
-
-# ========== FORM POLLING ==========
-def poll_forms():
-    """
-    Poll for new form submissions from ServiceTitan.
-    
-    Fetches recent form submissions and filters for those with materials.
-    Returns list of forms to process.
-    """
-    print("🔍 Polling for form submissions...")
-    
-    url = f"https://api-integration.servicetitan.io/forms/v2/tenant/{SERVICETITAN_TENANT_ID}/submissions"
+def add_materials_to_invoice(invoice_id, materials):
+    url = f"https://api-integration.servicetitan.io/sales/v2/tenant/{SERVICETITAN_TENANT_ID}/invoices/{invoice_id}"
     headers = {
         "Authorization": get_token(),
-        "ST-App-Key": SERVICETITAN_APP_KEY
+        "ST-App-Key": SERVICETITAN_APP_KEY,
+        "Content-Type": "application/json"
     }
-    
-    # Get submissions from last 10 minutes to catch new ones
-    from datetime import datetime, timedelta, timezone
+    payload = {"items": [
+        {"skuId": m["skuId"], "quantity": m["quantity"], "description": m["description"]}
+        for m in materials
+    ]}
+    response = requests.patch(url, headers=headers, json=payload)
+    if response.status_code == 401:
+        fetch_new_token()
+        headers["Authorization"] = get_token()
+        response = requests.patch(url, headers=headers, json=payload)
+    if 200 <= response.status_code < 300:
+        print(f"✅ Added {len(materials)} materials to invoice {invoice_id}")
+        return True
+    print(f"❌ Failed to add materials: {response.status_code} {response.text}")
+    return False
+
+# =================== FORMS POLLING ===================
+def poll_forms():
+    print("🔍 Checking for new form submissions...")
+    url = f"https://api-integration.servicetitan.io/forms/v2/tenant/{SERVICETITAN_TENANT_ID}/submissions"
+    headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY}
     ten_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    
-    params = {
-        "page": 1,
-        "pageSize": 50,
-        "modifiedOnOrAfter": ten_min_ago
-    }
-    
+    params = {"page": 1, "pageSize": 50, "modifiedOnOrAfter": ten_min_ago}
     response = requests.get(url, headers=headers, params=params)
-    
     if response.status_code == 401:
         fetch_new_token()
         headers["Authorization"] = get_token()
         response = requests.get(url, headers=headers, params=params)
-    
     if response.status_code != 200:
-        print(f"❌ Failed to fetch submissions: {response.status_code}")
+        print(f"❌ Failed to fetch forms: {response.status_code}")
         return []
-    
-    data = response.json()
-    submissions = data.get("data", [])
-    print(f"📋 Found {len(submissions)} recent submissions")
-    
-    new_forms = []
-    
-    for submission in submissions:
-        submission_id = submission.get("id")
-        job_id = submission.get("jobId")
-        
-        # Skip if already processed
-        if submission_id in processed_forms:
+
+    forms = []
+    for s in response.json().get("data", []):
+        sid, job_id = s.get("id"), s.get("jobId")
+        if not job_id or sid in processed_forms:
             continue
-        
-        # Look for materials field in the submission
         materials_text = None
-        for field in submission.get("fields", []):
-            field_name = field.get("name", "").lower()
-            # Check if this is the materials field
-            if "material" in field_name and "used" in field_name:
-                materials_text = field.get("value", "")
+        for f in s.get("fields", []):
+            name = f.get("name", "").lower()
+            if any(k in name for k in ["material", "materials", "part", "used", "installed"]):
+                materials_text = f.get("value", "")
                 break
-        
-        # Only process if materials were provided
-        if materials_text and materials_text.strip() and job_id:
-            new_forms.append({
-                "form_id": submission_id,
-                "job_id": job_id,
-                "materials_text": materials_text
-            })
-            print(f"✅ Found form {submission_id} with materials for job {job_id}")
-    
-    return new_forms
+        if materials_text and materials_text.strip():
+            forms.append({"form_id": sid, "job_id": job_id, "materials_text": materials_text})
+            print(f"✅ Found materials in form {sid} for job {job_id}")
+    return forms
 
-
-def process_form_submission(form_data):
-    """Process a form submission and add materials to invoice."""
-    form_id = form_data.get("form_id")
-    invoice_id = form_data.get("invoice_id")
-    materials_text = form_data.get("materials_text", "")
-    
+def process_form(form):
+    form_id, job_id = form["form_id"], form["job_id"]
     if form_id in processed_forms:
-        print(f"⏭️ Form {form_id} already processed")
+        print(f"⏭️ Already processed {form_id}")
         return
-    
-    print(f"\n📝 Processing form {form_id} for invoice {invoice_id}")
-    print(f"📄 Materials text:\n{materials_text}\n")
-    
-    # Parse materials
-    parsed_materials = parse_materials_from_text(materials_text)
-    print(f"📋 Parsed {len(parsed_materials)} material entries")
-    
-    # Get pricebook
+
+    invoice_id = get_invoice_id_from_job(job_id)
+    if not invoice_id:
+        print(f"⚠️ No invoice found for job {job_id}")
+        return
+
+    materials_text = form["materials_text"]
+    parsed = parse_materials_text(materials_text)
     pricebook = fetch_materials_pricebook()
-    
-    # Match materials to SKUs
-    matched_materials = []
-    unmatched_materials = []
-    
-    for material in parsed_materials:
-        sku_id, matched_name, confidence = match_material_to_sku(
-            material["description"], 
-            pricebook
-        )
-        
+
+    matched, unmatched = [], []
+    for m in parsed:
+        sku_id, name, score = match_material(m["description"], pricebook)
         if sku_id:
-            matched_materials.append({
+            matched.append({
                 "skuId": sku_id,
-                "quantity": material["quantity"],
-                "description": material["description"]
+                "quantity": m["quantity"],
+                "description": m["description"]
             })
-            print(f"✅ '{material['description']}' → '{matched_name}' ({confidence:.1%})")
+            print(f"✅ Matched '{m['description']}' → '{name}' ({score:.0%})")
         else:
-            unmatched_materials.append(material)
-            print(f"❌ No match for '{material['description']}'")
-    
-    # Add matched materials to invoice
-    if matched_materials:
-        success = add_materials_to_invoice(invoice_id, matched_materials)
+            unmatched.append(m["description"])
+
+    if matched:
+        success = add_materials_to_invoice(invoice_id, matched)
         if success:
             processed_forms.add(form_id)
             save_processed_forms()
-            print(f"✅ Form {form_id} processed successfully\n")
-        else:
-            print(f"⚠️ Failed to process form {form_id}\n")
     else:
-        print(f"⚠️ No materials could be matched for form {form_id}\n")
-    
-    if unmatched_materials:
-        print(f"⚠️ {len(unmatched_materials)} unmatched materials - review needed")
+        print(f"⚠️ No materials matched for form {form_id}")
 
+    if unmatched:
+        print(f"⚠️ Unmatched materials: {', '.join(unmatched)}")
 
+# =================== BACKGROUND POLLING LOOP ===================
 def polling_loop():
-    """Background thread polling for forms every POLL_INTERVAL seconds."""
-    print(f"🔄 Starting polling loop (every {POLL_INTERVAL}s)")
-    
+    print(f"🔄 Polling every {POLL_INTERVAL}s...")
     while True:
         try:
             new_forms = poll_forms()
-            for form in new_forms:
-                process_form_submission(form)
+            for f in new_forms:
+                process_form(f)
         except Exception as e:
             print(f"🔥 Polling error: {e}")
-        
         time.sleep(POLL_INTERVAL)
 
-
-# ========== ROUTES ==========
+# =================== FLASK ROUTES ===================
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "status": "running",
         "service": "ServiceTitan Form → Invoice Bridge",
-        "endpoints": {
-            "/test-matching": "POST - Test material matching",
-            "/manual-process": "POST - Manually process a form"
-        }
+        "processed_forms": len(processed_forms),
+        "cached_materials": len(materials_cache["data"])
     })
-
 
 @app.route("/test-matching", methods=["POST"])
-def test_material_matching():
-    """Test endpoint to preview how materials would be matched."""
-    try:
-        data = request.get_json()
-        materials_text = data.get("materials_text", "")
-        
-        if not materials_text:
-            return jsonify({"error": "materials_text required"}), 400
-        
-        parsed = parse_materials_from_text(materials_text)
-        pricebook = fetch_materials_pricebook()
-        
-        results = []
-        for material in parsed:
-            sku_id, matched_name, confidence = match_material_to_sku(
-                material["description"], 
-                pricebook
-            )
-            results.append({
-                "input": material["description"],
-                "quantity": material["quantity"],
-                "matched_sku_id": sku_id,
-                "matched_name": matched_name,
-                "confidence": f"{confidence:.1%}" if confidence else "No match"
-            })
-        
-        return jsonify({
-            "total_materials": len(parsed),
-            "results": results
-        }), 200
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+def test_matching():
+    data = request.get_json()
+    text = data.get("materials_text", "")
+    parsed = parse_materials_text(text)
+    pricebook = fetch_materials_pricebook()
+    results = []
+    for m in parsed:
+        sku, name, score = match_material(m["description"], pricebook)
+        results.append({
+            "input": m["description"],
+            "quantity": m["quantity"],
+            "match": name or "No match",
+            "confidence": f"{score:.0%}"
+        })
+    return jsonify({"results": results})
 
-
-@app.route("/manual-process", methods=["POST"])
-def manual_process():
-    """Manually trigger processing of a form (for testing)."""
-    try:
-        data = request.get_json()
-        required = ["form_id", "invoice_id", "materials_text"]
-        
-        if not all(k in data for k in required):
-            return jsonify({"error": f"Required: {required}"}), 400
-        
-        process_form_submission(data)
-        
-        return jsonify({
-            "success": True,
-            "message": f"Processed form {data['form_id']}"
-        }), 200
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/stats", methods=["GET"])
-def stats():
-    """Get processing statistics."""
-    return jsonify({
-        "processed_forms_count": len(processed_forms),
-        "cached_materials_count": len(materials_cache["data"]),
-        "cache_age_seconds": int(time.time() - materials_cache["last_updated"]),
-        "poll_interval_seconds": POLL_INTERVAL
-    })
-
-
-# ========== MAIN ==========
+# =================== MAIN ===================
 if __name__ == "__main__":
     print("🚀 Starting ServiceTitan Form → Invoice Bridge")
-    
-    # Load cached data
     load_token_from_file()
     load_processed_forms()
-    
-    # Get initial token
     if not token_data["access_token"]:
         fetch_new_token()
-    
-    # Start background polling
-    polling_thread = threading.Thread(target=polling_loop, daemon=True)
-    polling_thread.start()
-    
-    print("✅ Ready to process forms\n")
+    threading.Thread(target=polling_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
