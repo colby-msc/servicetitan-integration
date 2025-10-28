@@ -89,6 +89,8 @@ def save_processed_forms():
         print(f"⚠️ Could not save processed forms: {e}")
 
 # =================== MATERIALS ===================
+MAX_MATERIALS_TEST = 500  # limit materials fetched for testing
+
 def fetch_materials_pricebook():
     if time.time() - materials_cache["last_updated"] < materials_cache["cache_duration"]:
         return materials_cache["data"]
@@ -114,6 +116,11 @@ def fetch_materials_pricebook():
         if not items:
             break
         all_materials.extend(items)
+
+        # ✅ STOP EARLY FOR TESTING
+        if len(all_materials) >= MAX_MATERIALS_TEST:
+            break
+
         if not data.get("hasMore", False):
             break
         page += 1
@@ -145,7 +152,6 @@ def parse_materials_text(text):
         line = line.strip()
         if not line:
             continue
-        # Allow multiple items separated by commas
         for part in line.split(","):
             part = part.strip()
             if not part:
@@ -198,6 +204,8 @@ def add_materials_to_invoice(invoice_id, materials):
     return False
 
 # =================== FORMS POLLING ===================
+MAX_FORMS_TEST = 5  # process at most 5 forms per polling cycle
+
 def poll_forms(debug=False):
     print("🔍 Checking for new form submissions...")
     url = f"https://api-integration.servicetitan.io/forms/v2/tenant/{SERVICETITAN_TENANT_ID}/submissions"
@@ -206,7 +214,7 @@ def poll_forms(debug=False):
     lookback = timedelta(hours=1) if debug else timedelta(minutes=10)
     modified_since = (datetime.now(timezone.utc) - lookback).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    params = {"page": 1, "pageSize": 50, "modifiedOnOrAfter": modified_since}
+    params = {"page": 1, "pageSize": 10, "modifiedOnOrAfter": modified_since}  # ✅ limit forms
     response = requests.get(url, headers=headers, params=params)
 
     if response.status_code == 401:
@@ -225,88 +233,70 @@ def poll_forms(debug=False):
     for s in data:
         form_id = s.get("id")
         print(f"\n➡️ Form ID: {form_id}")
-
-        # Show all units (for debugging)
         for unit in s.get("units", []):
             print(f"   Unit: {unit.get('name')} = {unit.get('value')}")
-
         job_id = next((o.get("id") for o in s.get("owners", []) if o.get("type") == "Job"), None)
         print(f"   Linked Job ID: {job_id}")
 
-        if not job_id:
-            print("   ⚠️ Skipping: No job associated")
-            continue
-        if form_id in processed_forms:
-            print("   ⏭️ Skipping: Already processed")
+        if not job_id or form_id in processed_forms:
             continue
 
-        # Only look at units, safely handle missing names
-        materials_text = None
-        for u in s.get("units", []):
-            name = u.get("name")
-            if name and "materials used" in name.lower():
-                materials_text = u.get("value")
-                break
+        materials_text = next(
+            (u.get("value") for u in s.get("units", []) if u.get("name") and "materials used" in u.get("name").lower()),
+            None
+        )
 
-        if materials_text and str(materials_text).strip():
+        if materials_text and materials_text.strip():
             forms.append({"form_id": form_id, "job_id": job_id, "materials_text": materials_text})
-            print(f"✅ Found materials text for processing")
         else:
-            print("   ⚠️ No 'materials used' field found")
+            print("⚠️ No 'materials used' field found")
+
+        if len(forms) >= MAX_FORMS_TEST:  # ✅ limit forms processed
+            break
 
     return forms
 
-
-
-def process_form(form):
-    form_id, job_id = form["form_id"], form["job_id"]
-    if form_id in processed_forms:
-        print(f"ℹ️ Form {form_id} already processed")
-        return
-    materials_list = parse_materials_text(form["materials_text"])
-    materials_pricebook = fetch_materials_pricebook()
-    matched_materials = []
-    for m in materials_list:
-        skuId, name, score = match_material(m["description"], materials_pricebook)
-        if skuId:
-            matched_materials.append({"skuId": skuId, "quantity": m["quantity"], "description": name})
-        else:
-            print(f"⚠️ Could not match '{m['description']}'")
-
-    invoice_id = get_invoice_id_from_job(job_id)
-    if invoice_id and matched_materials:
-        if add_materials_to_invoice(invoice_id, matched_materials):
-            processed_forms.add(form_id)
-            save_processed_forms()
-
+# =================== POLLING CYCLE ===================
 def run_polling_cycle(debug=False):
-    load_processed_forms()
-    forms = poll_forms(debug=debug)
-    for form in forms:
-        process_form(form)
+    materials_data = fetch_materials_pricebook()
+    forms_to_process = poll_forms(debug=debug)
 
-# =================== FLASK ENDPOINTS ===================
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({"status": "ok", "message": "ServiceTitan materials automation running"}), 200
+    for f in forms_to_process:
+        parsed_materials = parse_materials_text(f["materials_text"])
+        matched_materials = []
 
-@app.route("/poll", methods=["GET", "POST"])
+        for m in parsed_materials:
+            sku_id, name, score = match_material(m["description"], materials_data)
+            if sku_id:
+                matched_materials.append({"skuId": sku_id, "quantity": m["quantity"], "description": m["description"]})
+            else:
+                print(f"⚠️ Could not match '{m['description']}'")
+
+        invoice_id = get_invoice_id_from_job(f["job_id"])
+        if invoice_id:
+            add_materials_to_invoice(invoice_id, matched_materials)
+        processed_forms.add(f["form_id"])
+
+    save_processed_forms()
+
+# =================== FLASK ENDPOINT ===================
+@app.route("/poll")
 def poll_endpoint():
     secret = request.args.get("secret")
+    debug = request.args.get("debug") == "true"
+
     if secret != POLL_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
-    debug = request.args.get("debug", "false").lower() == "true"
+        return "Unauthorized", 401
+
     try:
         run_polling_cycle(debug=debug)
-        return jsonify({"status": "success"}), 200
+        return jsonify({"status": "ok"})
     except Exception as e:
-        print(f"❌ Polling failed: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        print(f"❌ Error during polling: {e}")
+        return "Internal Server Error", 500
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "healthy"}), 200
-
+# =================== APP START ===================
 if __name__ == "__main__":
     load_token_from_file()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    load_processed_forms()
+    app.run(host="0.0.0.0", port=5000)
