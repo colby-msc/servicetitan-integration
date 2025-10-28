@@ -218,7 +218,7 @@ def add_materials_to_invoice(invoice_id, materials_to_add):
     Add materials to invoice using PATCH endpoint.
     materials_to_add: [{"skuId": id, "quantity": qty, "description": desc}]
     """
-    url = f"https://api-inntegration.servicetitan.io/sales/v2/tenant/{SERVICETITAN_TENANT_ID}/invoices/{invoice_id}"
+    url = f"https://api-integration.servicetitan.io/sales/v2/tenant/{SERVICETITAN_TENANT_ID}/invoices/{invoice_id}"
     headers = {
         "Content-Type": "application/json",
         "Authorization": get_token(),
@@ -351,21 +351,11 @@ def poll_forms():
 def process_form_submission(form_data):
     """Process a form submission and add materials to invoice."""
     form_id = form_data.get("form_id")
-    job_id = form_data.get("job_id")
+    invoice_id = form_data.get("invoice_id")
     materials_text = form_data.get("materials_text", "")
     
     if form_id in processed_forms:
         print(f"⏭️ Form {form_id} already processed")
-        return
-    
-    # Get invoice ID from job
-    invoice_id = form_data.get("invoice_id")
-    if not invoice_id and job_id:
-        print(f"🔍 Getting invoice ID for job {job_id}")
-        invoice_id = get_invoice_id_from_job(job_id)
-    
-    if not invoice_id:
-        print(f"❌ Could not find invoice for form {form_id}")
         return
     
     print(f"\n📝 Processing form {form_id} for invoice {invoice_id}")
@@ -484,16 +474,10 @@ def manual_process():
     """Manually trigger processing of a form (for testing)."""
     try:
         data = request.get_json()
+        required = ["form_id", "invoice_id", "materials_text"]
         
-        # Support both invoice_id directly or job_id lookup
-        if "job_id" in data and "invoice_id" not in data:
-            data["invoice_id"] = get_invoice_id_from_job(data["job_id"])
-            if not data["invoice_id"]:
-                return jsonify({"error": "Could not find invoice for job"}), 404
-        
-        required = ["form_id", "materials_text"]
         if not all(k in data for k in required):
-            return jsonify({"error": f"Required: {required} and either invoice_id or job_id"}), 400
+            return jsonify({"error": f"Required: {required}"}), 400
         
         process_form_submission(data)
         
