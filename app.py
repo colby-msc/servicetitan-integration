@@ -100,6 +100,7 @@ def fetch_materials_pricebook():
         items = data.get("data", [])
         if not items:
             break
+        # Store essential fields only
         for item in items:
             all_materials.append({
                 "id": item.get("id"),
@@ -165,95 +166,66 @@ def extract_numbers_with_units(text):
     if not text:
         return []
     t = text.lower().replace('"', 'in')
-    matches = re.findall(r'(\d+(?:\.\d+)?)(?:\s*(in|ft|inch|inches|feet))?', t)
-    results = []
-    for num, unit in matches:
-        if unit:
-            unit = unit.replace('inches', 'in').replace('inch', 'in').replace('feet', 'ft')
-            results.append(f"{num}{unit}")
-        else:
-            results.append(num)
-    return results
+    # extract numbers, including comma-separated for multi-number parts
+    nums = []
+    for part in re.split(r'[,\s]+', t):
+        m = re.match(r'(\d+(?:\.\d+)?)(in|ft)?', part)
+        if m:
+            val, unit = m.groups()
+            if unit:
+                unit = unit.replace('inches', 'in').replace('inch', 'in').replace('feet', 'ft')
+                nums.append(f"{val}{unit}")
+            else:
+                nums.append(val)
+    return nums
 
 # =================== MATERIAL MATCHING ===================
-def match_material(description, materials):
-    def normalize_fraction_numbers(text):
-        text = re.sub(r'(\d+)-(\d+)/(\d+)', lambda m: str(int(m.group(1)) + int(m.group(2))/int(m.group(3))), text)
-        text = re.sub(r'(\d+)/(\d+)', lambda m: str(int(m.group(1))/int(m.group(2))), text)
-        return text
-
-    def extract_numbers(text):
-        text = normalize_fraction_numbers(text.lower().replace('"', 'in'))
-        return [m.strip() for m in re.findall(r'(\d+(?:\.\d+)?)', text)]
-
-    def numeric_sequence_score(desc_nums, field_nums):
-        if not desc_nums or not field_nums:
-            return 0
-        matched = 0
-        for dn in desc_nums:
-            dn_val = float(dn)
-            for fn in field_nums:
-                fn_val = float(fn)
-                if abs(dn_val - fn_val) / max(dn_val, fn_val) < 0.15:
-                    matched += 1
-                    break
-        return matched / max(len(desc_nums), len(field_nums))
-
-    desc_norm = normalize_material_text(expand_synonyms(description))
-    desc_numbers = extract_numbers(desc_norm)
-    categories = {
-        "flex": ["flex", "flexible", "duct"],
-        "elbow": ["elbow", "90"],
-        "wrap": ["wrap", "insulation"],
-        "tape": ["tape", "foil"],
-        "wye": ["wye"]
-    }
-    desc_tokens = set(desc_norm.split())
-    desc_category = {cat for cat, keys in categories.items() if any(k in desc_tokens for k in keys)}
-
-    scored_matches = []
-
-    for m in materials:
-        name = m.get("displayName", "")
-        code = m.get("code", "")
-        desc = m.get("description", "")
-        fields = [name, code, desc]
-
-        best_field_score = 0
-        for field in fields:
-            if not field:
+def numeric_sequence_score(desc_nums, field_nums):
+    if not desc_nums or not field_nums:
+        return 0
+    matched = 0
+    for dn in desc_nums:
+        try:
+            dn_val = float(re.findall(r'\d+\.?\d*', dn)[0])
+        except:
+            continue
+        for fn in field_nums:
+            try:
+                fn_val = float(re.findall(r'\d+\.?\d*', fn)[0])
+            except:
                 continue
+            if abs(dn_val - fn_val) / max(dn_val, fn_val) < 0.15:
+                matched += 1
+                break
+    return matched / max(len(desc_nums), len(field_nums))  # safe division
+
+def match_material(description, materials):
+    desc_norm = normalize_material_text(expand_synonyms(description))
+    desc_numbers = extract_numbers_with_units(desc_norm)
+    keywords = ["flex", "elbow", "wrap", "tape", "wye"]
+
+    filtered = []
+    for m in materials:
+        text = " ".join(filter(None, [m.get("displayName"), m.get("description"), m.get("code")])).lower()
+        if any(k in text for k in keywords) or any(n in text for n in desc_numbers):
+            filtered.append(m)
+
+    best_score = 0
+    best_material = None
+    for m in filtered:
+        for field in [m.get("displayName") or "", m.get("description") or "", m.get("code") or ""]:
             field_norm = normalize_material_text(expand_synonyms(field))
-            field_numbers = extract_numbers(field_norm)
-            field_tokens = set(field_norm.split())
-
-            fuzzy_score = max(fuzz.partial_ratio(desc_norm, field_norm),
-                              fuzz.token_sort_ratio(desc_norm, field_norm)) / 100.0
-            numeric_score = numeric_sequence_score(desc_numbers, field_numbers)
-            semantic_score = 0.0
-            for cat, keys in categories.items():
-                if cat in desc_category and any(k in field_tokens for k in keys):
-                    semantic_score += 0.6
-            total_score = 0.35 * fuzzy_score + 0.50 * numeric_score + 0.15 * semantic_score
-            total_score = min(total_score, 1.0)
-            best_field_score = max(best_field_score, total_score)
-
-        if best_field_score > 0:
-            scored_matches.append({
-                "id": m["id"],
-                "name": name,
-                "score": best_field_score
-            })
-
-    scored_matches.sort(key=lambda x: x["score"], reverse=True)
-    top_matches = scored_matches[:3]
-
-    print(f"\n🔎 Debug matches for '{description}':")
-    for i, t in enumerate(top_matches, start=1):
-        print(f"   {i}. {t['name']} (score {t['score']:.2f})")
-
-    best = top_matches[0] if top_matches else {"id": None, "name": None, "score": 0}
-    return (best["id"], best["name"], best["score"]) if best["score"] >= 0.55 else (None, None, 0)
+            score = fuzz.partial_ratio(desc_norm, field_norm) / 100.0
+            # numeric bonus
+            field_numbers = extract_numbers_with_units(field_norm)
+            score += numeric_sequence_score(desc_numbers, field_numbers) * 0.2
+            score = min(score, 1.0)
+            if score > best_score:
+                best_score = score
+                best_material = m
+    if best_score >= 0.55 and best_material:
+        return best_material["id"], best_material["displayName"], best_score
+    return None, None, 0
 
 # =================== SERVICE TITAN OPERATIONS ===================
 def get_invoice_id_from_job(job_id):
