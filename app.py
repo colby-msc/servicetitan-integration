@@ -123,14 +123,16 @@ def normalize_material_text(text):
     return text.strip()
 
 def expand_synonyms(text):
-    """Replace keywords with synonyms using regex for whole words."""
-    if not text:
-        return text
     out = text
-    for key, vals in SYNONYMS.items():
-        pattern = r'\b' + re.escape(key) + r'\b'
-        out = re.sub(pattern, vals[0], out, flags=re.IGNORECASE)
+    for pattern, vals in SYNONYMS.items():
+        try:
+            # Escape the pattern so commas, quotes, etc. don’t break regex
+            safe_pattern = re.escape(pattern)
+            out = re.sub(safe_pattern, vals[0], out, flags=re.IGNORECASE)
+        except re.error as e:
+            print(f"⚠️ Regex error in pattern '{pattern}': {e}")
     return out
+
 
 def parse_materials_text(text):
     """
