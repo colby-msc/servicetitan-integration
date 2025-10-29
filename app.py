@@ -4,7 +4,7 @@ import json
 import time
 import os
 import re
-from difflib import SequenceMatcher
+from rapidfuzz import fuzz
 from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
@@ -109,6 +109,7 @@ def normalize_material_text(text):
     text = text.lower()
     text = text.replace("”", '"').replace("“", '"').replace("–", "-").replace("—", "-")
     text = text.replace("in.", "in").replace("inch", "in").replace('"', 'in')
+    text = re.sub(r'\b(ft|feet|roll|of|bag|pcs?|each|ea|unit|piece|per)\b', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
@@ -131,23 +132,27 @@ def parse_materials_text(text):
 
 # =================== MATERIAL MATCHING ===================
 def match_material(description, materials):
-    """Fuzzy matching with numeric boosts, no fixed mapping."""
+    """Improved fuzzy matching using RapidFuzz with numeric boosting."""
     desc = normalize_material_text(description)
     best = {"id": None, "name": None, "score": 0}
+
+    # Extract numeric values like 6in, 10ft
+    desc_numbers = re.findall(r'\d+\s*(in|ft)?', desc)
+
     for m in materials:
         for field in [m.get("displayName", ""), m.get("description", ""), m.get("code", "")]:
             if not field:
                 continue
             field_norm = normalize_material_text(field)
-            score = SequenceMatcher(None, desc, field_norm).ratio()
+            score = fuzz.token_sort_ratio(desc, field_norm) / 100.0
 
-            # Boost score if numeric size matches (6in, 10in, 15ft, etc.)
-            size_match = re.findall(r'(\d+in|\d+ft|\d+")', desc)
-            if size_match:
-                for s in size_match:
-                    if s in field_norm:
-                        score += 0.15
+            # Boost if numeric values match
+            field_numbers = re.findall(r'\d+\s*(in|ft)?', field_norm)
+            for dn in desc_numbers:
+                if dn in field_numbers:
+                    score += 0.15
 
+            score = min(score, 1.0)
             if score > best["score"]:
                 best = {"id": m["id"], "name": m.get("displayName", ""), "score": score}
 
