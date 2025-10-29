@@ -53,7 +53,6 @@ def fetch_new_token():
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     response = requests.post(url, data=payload, headers=headers)
-
     if response.status_code == 200:
         data = response.json()
         token_data["access_token"] = f"Bearer {data['access_token']}"
@@ -90,13 +89,11 @@ def fetch_materials_pricebook():
         if response.status_code != 200:
             print(f"❌ Error fetching materials: {response.status_code}")
             break
-
         data = response.json()
         items = data.get("data", [])
         if not items:
             break
         all_materials.extend(items)
-
         if not data.get("hasMore", False):
             break
         page += 1
@@ -106,34 +103,12 @@ def fetch_materials_pricebook():
     print(f"✅ Cached {len(all_materials)} materials")
     return all_materials
 
-# =================== MATERIAL MATCHING HELPERS ===================
-ALIASES = {
-    "flex": ["flex", "flex duct"],
-    "insulation wrap": ["duct wrap", "insulation wrap", "wrap"],
-    "silvertape": ["silver tape", "silvertape"],
-    "90": ["elbow", "90"],
-}
-
-FIXED_MAPPING = {
-    "1 x 17ft of 6” flex": "R6-6IN X 25FT FLEX DUCT BAG",
-    "1 x 10” 90": "10IN HARD PIPE ELBOW",
-    "1 x roll of silvertape": "322 NASHUA 3IN SILVER FOIL TAPE (150 FT PER ROLL)",
-    "15ft of insulation wrap": "DUCT WRAP R6 - 75' - DUCT INSULATION",
-}
-
-def normalize_material(desc):
-    desc_lower = desc.lower()
-    for key, variants in ALIASES.items():
-        for v in variants:
-            if v in desc_lower:
-                return key
-    return desc_lower
-
-def normalize_text(text):
+# =================== TEXT PARSING HELPERS ===================
+def normalize_material_text(text):
+    """Normalize text while preserving numbers and units."""
     text = text.lower()
-    text = text.replace("”", '"').replace("“", '"').replace("–", "-")
+    text = text.replace("”", '"').replace("“", '"').replace("–", "-").replace("—", "-")
     text = text.replace("in.", "in").replace("inch", "in").replace('"', 'in')
-    text = re.sub(r'\b(ft|feet|roll|of|bag|pcs?|each|ea|unit|piece|per)\b', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
@@ -144,7 +119,6 @@ def parse_materials_text(text):
         line = raw_line.strip()
         if not line:
             continue
-        line = line.replace("”", '"').replace("“", '"').replace("–", "-").replace("—", "-")
         match = re.match(r"^(\d+)\s*[-xX]?\s*(.+)$", line)
         if match:
             qty = int(match.group(1))
@@ -155,38 +129,29 @@ def parse_materials_text(text):
         materials.append({"quantity": qty, "description": desc})
     return materials
 
-def match_material(desc, materials):
-    """Match parsed material to a pricebook item using fixed mapping + fuzzy match."""
-    # 1️⃣ Check fixed mapping
-    if desc in FIXED_MAPPING:
-        for m in materials:
-            if m.get("displayName") == FIXED_MAPPING[desc]:
-                return m["id"], m["displayName"], 1.0
-
-    # 2️⃣ Normalize description
-    key = normalize_material(desc)
-    best_id, best_name, best_score = None, None, 0
-
+# =================== MATERIAL MATCHING ===================
+def match_material(description, materials):
+    """Fuzzy matching with numeric boosts, no fixed mapping."""
+    desc = normalize_material_text(description)
+    best = {"id": None, "name": None, "score": 0}
     for m in materials:
-        name_fields = [m.get("displayName", ""), m.get("description", ""), m.get("code", "")]
-        for field in name_fields:
+        for field in [m.get("displayName", ""), m.get("description", ""), m.get("code", "")]:
             if not field:
                 continue
-            field_lower = field.lower()
-            if key in field_lower:  # exact normalized keyword match
-                return m["id"], m["displayName"], 1.0
-            # fallback fuzzy matching
-            score = SequenceMatcher(None, key, field_lower).ratio()
-            # Boost if sizes match
-            size_match = re.search(r'\b(\d+in)\b', desc.lower())
-            if size_match and size_match.group(1) in field_lower:
-                score += 0.15
-            if score > best_score:
-                best_score, best_id, best_name = score, m["id"], m.get("displayName", "")
+            field_norm = normalize_material_text(field)
+            score = SequenceMatcher(None, desc, field_norm).ratio()
 
-    if best_score > 0.6:
-        return best_id, best_name, best_score
-    return None, None, 0
+            # Boost score if numeric size matches (6in, 10in, 15ft, etc.)
+            size_match = re.findall(r'(\d+in|\d+ft|\d+")', desc)
+            if size_match:
+                for s in size_match:
+                    if s in field_norm:
+                        score += 0.15
+
+            if score > best["score"]:
+                best = {"id": m["id"], "name": m.get("displayName", ""), "score": score}
+
+    return (best["id"], best["name"], best["score"]) if best["score"] > 0.6 else (None, None, 0)
 
 # =================== SERVICE TITAN OPERATIONS ===================
 def get_invoice_id_from_job(job_id):
@@ -215,7 +180,7 @@ def add_materials_to_invoice(invoice_id, materials):
     }
     payload = {"items": [
         {"skuId": m["skuId"], "quantity": m["quantity"], "description": m["description"]}
-        for m in materials if m.get("skuId")
+        for m in materials
     ]}
     response = requests.patch(url, headers=headers, json=payload)
     if response.status_code == 401:
@@ -237,7 +202,6 @@ def poll_endpoint():
 
     print("🔍 Poll triggered (testing last form only)")
     try:
-        # Fetch latest form submission
         url = f"https://api-integration.servicetitan.io/forms/v2/tenant/{SERVICETITAN_TENANT_ID}/submissions"
         headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY}
         params = {
@@ -245,7 +209,6 @@ def poll_endpoint():
             "pageSize": 1,
             "modifiedOnOrAfter": (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
         }
-
         response = requests.get(url, headers=headers, params=params)
         if response.status_code == 401:
             fetch_new_token()
@@ -263,7 +226,6 @@ def poll_endpoint():
         form = data[0]
         form_id = form.get("id")
         job_id = next((o.get("id") for o in form.get("owners", []) if o.get("type") == "Job"), None)
-
         print(f"\n➡️ Most recent Form ID: {form_id}")
         print(f"   Linked Job ID: {job_id}")
 
@@ -271,37 +233,28 @@ def poll_endpoint():
             (u.get("value") for u in form.get("units", []) if u.get("name") and "materials used" in u.get("name").lower()),
             None
         )
-
         if not materials_text:
             print("⚠️ No 'materials used' field found")
             return jsonify({"status": "success", "message": "No materials field"}), 200
 
         print(f"   Materials Used:\n{materials_text}")
 
-        # Parse and match
         materials_data = fetch_materials_pricebook()
         parsed_materials = parse_materials_text(materials_text)
         for m in parsed_materials:
             sku_id, name, score = match_material(m["description"], materials_data)
             if sku_id:
                 print(f"✅ Matched '{m['description']}' → {name} (score {score:.2f})")
-                m["skuId"] = sku_id
             else:
                 print(f"⚠️ Could not match '{m['description']}'")
-                m["skuId"] = None
 
-        invoice_id = get_invoice_id_from_job(job_id)
-        if invoice_id:
-            add_materials_to_invoice(invoice_id, parsed_materials)
-        else:
-            print("⚠️ No invoice found for job")
-
-        return jsonify({"status": "success"}), 200
+        return jsonify({"status": "success", "form_id": form_id}), 200
 
     except Exception as e:
-        print(f"❌ Exception during poll: {e}")
+        print(f"❌ Polling failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# =================== APP START ===================
 if __name__ == "__main__":
     load_token_from_file()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000)
