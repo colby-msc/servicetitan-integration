@@ -195,14 +195,13 @@ def extract_numbers_with_units(text):
 
 # =================== MATERIAL MATCHING ===================
 def match_material(description, materials):
-    """Hybrid AI-style matcher with semantic bias + debug output."""
+    """Tuned AI-style matcher for HVAC materials."""
     desc_expanded = expand_synonyms(description)
     desc_norm = normalize_material_text(desc_expanded)
     desc_numbers = extract_numbers_with_units(desc_norm)
 
-    # Category keyword tags
     categories = {
-        "flex": ["flex", "flexible"],
+        "flex": ["flex", "flexible", "duct"],
         "elbow": ["elbow", "90"],
         "wrap": ["wrap", "insulation"],
         "tape": ["tape", "foil"],
@@ -227,7 +226,7 @@ def match_material(description, materials):
             field_numbers = extract_numbers_with_units(field_norm)
             field_tokens = set(field_norm.split())
 
-            # 1️⃣ Fuzzy similarity
+            # 1️⃣ Fuzzy text similarity
             fuzzy_score = max(
                 fuzz.partial_ratio(desc_norm, field_norm),
                 fuzz.token_sort_ratio(desc_norm, field_norm)
@@ -235,18 +234,19 @@ def match_material(description, materials):
 
             # 2️⃣ Numeric matching
             numeric_matches = sum(dn == fn for dn in desc_numbers for fn in field_numbers)
-            numeric_score = 0.1 * numeric_matches
+            numeric_partial = sum(dn in fn or fn in dn for dn in desc_numbers for fn in field_numbers)
+            numeric_score = 0.15 * numeric_matches + 0.05 * numeric_partial
 
             # 3️⃣ Semantic category weighting
             semantic_score = 0.0
             for cat, keys in categories.items():
                 if cat in desc_category and any(k in field_tokens for k in keys):
                     semantic_score += 0.4
-                elif cat in desc_category and any(bad in field_tokens for bad in ["wire", "breaker", "motor"]):
-                    semantic_score -= 0.3  # penalize wrong type
+                elif cat in desc_category and any(bad in field_tokens for bad in ["wire", "breaker", "motor", "circuit"]):
+                    semantic_score -= 0.3
 
             # 4️⃣ Combine
-            total_score = 0.6 * fuzzy_score + 0.2 * semantic_score + 0.15 * numeric_score
+            total_score = 0.55 * fuzzy_score + 0.25 * semantic_score + 0.15 * numeric_score
             total_score = min(total_score, 1.0)
 
             best_field_score = max(best_field_score, total_score)
@@ -258,7 +258,7 @@ def match_material(description, materials):
                 "score": best_field_score
             })
 
-    # Sort and log top matches
+    # Sort & debug
     scored_matches.sort(key=lambda x: x["score"], reverse=True)
     top_matches = scored_matches[:3]
 
@@ -267,7 +267,8 @@ def match_material(description, materials):
         print(f"   {i}. {t['name']} (score {t['score']:.2f})")
 
     best = top_matches[0] if top_matches else {"id": None, "name": None, "score": 0}
-    return (best["id"], best["name"], best["score"]) if best["score"] >= 0.65 else (None, None, 0)
+    # lowered threshold slightly from 0.65 → 0.60
+    return (best["id"], best["name"], best["score"]) if best["score"] >= 0.60 else (None, None, 0)
 
 
 # =================== SERVICE TITAN OPERATIONS ===================
