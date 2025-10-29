@@ -22,6 +22,14 @@ TOKEN_FILE = "token_cache.json"
 token_data = {"access_token": None, "expires_at": 0}
 materials_cache = {"data": [], "last_updated": 0, "cache_duration": 3600}
 
+# =================== SYNONYMS ===================
+SYNONYMS = {
+    "flex": ["duct", "flexible duct"],
+    "silvertape": ["foil tape", "silver tape"],
+    "insulation wrap": ["duct insulation", "duct wrap"],
+    "elbow": ["pipe elbow", "hard pipe elbow"]
+}
+
 # =================== TOKEN MANAGEMENT ===================
 def save_token_to_file():
     try:
@@ -113,6 +121,12 @@ def normalize_material_text(text):
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
+def expand_synonyms(text):
+    for key, vals in SYNONYMS.items():
+        for val in vals:
+            text = text.replace(key, val)
+    return text
+
 def parse_materials_text(text):
     """Parses text like '2x 6in flex' or '1- silvertape'."""
     materials = []
@@ -132,21 +146,21 @@ def parse_materials_text(text):
 
 # =================== MATERIAL MATCHING ===================
 def match_material(description, materials):
-    """Improved fuzzy matching using RapidFuzz with numeric boosting."""
-    desc = normalize_material_text(description)
+    """Fuzzy match with numeric boosting and synonyms."""
+    desc_norm = normalize_material_text(expand_synonyms(description))
+    desc_numbers = re.findall(r'\d+\s*(in|ft)?', desc_norm)
     best = {"id": None, "name": None, "score": 0}
-
-    # Extract numeric values like 6in, 10ft
-    desc_numbers = re.findall(r'\d+\s*(in|ft)?', desc)
 
     for m in materials:
         for field in [m.get("displayName", ""), m.get("description", ""), m.get("code", "")]:
             if not field:
                 continue
-            field_norm = normalize_material_text(field)
-            score = fuzz.token_sort_ratio(desc, field_norm) / 100.0
+            field_norm = normalize_material_text(expand_synonyms(field))
+            score = max(
+                fuzz.token_sort_ratio(desc_norm, field_norm),
+                fuzz.partial_ratio(desc_norm, field_norm)
+            ) / 100.0
 
-            # Boost if numeric values match
             field_numbers = re.findall(r'\d+\s*(in|ft)?', field_norm)
             for dn in desc_numbers:
                 if dn in field_numbers:
@@ -205,7 +219,7 @@ def poll_endpoint():
     if secret != POLL_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
 
-    print("🔍 Poll triggered (testing last form only)")
+    print("🔍 Poll triggered (fetching last form submission)")
     try:
         url = f"https://api-integration.servicetitan.io/forms/v2/tenant/{SERVICETITAN_TENANT_ID}/submissions"
         headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY}
@@ -246,12 +260,23 @@ def poll_endpoint():
 
         materials_data = fetch_materials_pricebook()
         parsed_materials = parse_materials_text(materials_text)
+        invoice_items = []
         for m in parsed_materials:
             sku_id, name, score = match_material(m["description"], materials_data)
             if sku_id:
                 print(f"✅ Matched '{m['description']}' → {name} (score {score:.2f})")
+                invoice_items.append({
+                    "skuId": sku_id,
+                    "quantity": m["quantity"],
+                    "description": name
+                })
             else:
                 print(f"⚠️ Could not match '{m['description']}'")
+
+        if job_id and invoice_items:
+            invoice_id = get_invoice_id_from_job(job_id)
+            if invoice_id:
+                add_materials_to_invoice(invoice_id, invoice_items)
 
         return jsonify({"status": "success", "form_id": form_id}), 200
 
