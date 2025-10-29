@@ -31,14 +31,14 @@ SYNONYMS = {
 }
 
 # =================== TOKEN MANAGEMENT ===================
-def save_token_to_file():
+def save_token(token_info):
     try:
         with open(TOKEN_FILE, "w") as f:
-            json.dump(token_data, f)
+            json.dump(token_info, f)
     except Exception as e:
         print(f"⚠️ Could not save token: {e}")
 
-def load_token_from_file():
+def load_token():
     if os.path.exists(TOKEN_FILE):
         try:
             with open(TOKEN_FILE, "r") as f:
@@ -49,7 +49,7 @@ def load_token_from_file():
         except Exception as e:
             print(f"⚠️ Could not read cached token: {e}")
 
-def fetch_new_token():
+def fetch_token():
     print("🔐 Fetching new ServiceTitan token...")
     url = "https://auth-integration.servicetitan.io/connect/token"
     payload = {
@@ -58,44 +58,42 @@ def fetch_new_token():
         "client_secret": CLIENT_SECRET,
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    response = requests.post(url, data=payload, headers=headers)
-    if response.status_code == 200:
-        data = response.json()
+    resp = requests.post(url, data=payload, headers=headers)
+    if resp.status_code == 200:
+        data = resp.json()
         token_data["access_token"] = f"Bearer {data['access_token']}"
         token_data["expires_at"] = time.time() + data.get("expires_in", 900) - 30
-        save_token_to_file()
+        save_token(token_data)
         print("✅ Token refreshed")
     else:
-        print(f"❌ Failed to fetch token: {response.status_code} {response.text}")
-        raise Exception("ServiceTitan token fetch failed")
+        raise Exception(f"ServiceTitan token fetch failed: {resp.status_code} {resp.text}")
 
 def get_token():
     if not token_data["access_token"] or time.time() > token_data["expires_at"]:
-        fetch_new_token()
+        fetch_token()
     return token_data["access_token"]
 
 # =================== MATERIALS FETCH ===================
-def fetch_materials_pricebook():
+def fetch_materials():
     if time.time() - materials_cache["last_updated"] < materials_cache["cache_duration"]:
         return materials_cache["data"]
 
     print("🔄 Fetching materials from pricebook...")
     url = f"https://api-integration.servicetitan.io/pricebook/v2/tenant/{SERVICETITAN_TENANT_ID}/materials"
     headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY}
-    all_materials = []
-    page = 1
+    all_materials, page = [], 1
 
     while True:
         params = {"page": page, "pageSize": 500}
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code == 401:
-            fetch_new_token()
+        resp = requests.get(url, headers=headers, params=params)
+        if resp.status_code == 401:
+            fetch_token()
             headers["Authorization"] = get_token()
-            response = requests.get(url, headers=headers, params=params)
-        if response.status_code != 200:
-            print(f"❌ Error fetching materials: {response.status_code}")
+            resp = requests.get(url, headers=headers, params=params)
+        if resp.status_code != 200:
+            print(f"❌ Error fetching materials: {resp.status_code}")
             break
-        data = response.json()
+        data = resp.json()
         items = data.get("data", [])
         if not items:
             break
@@ -104,18 +102,15 @@ def fetch_materials_pricebook():
             break
         page += 1
 
-    materials_cache["data"] = all_materials
-    materials_cache["last_updated"] = time.time()
+    materials_cache.update({"data": all_materials, "last_updated": time.time()})
     print(f"✅ Cached {len(all_materials)} materials")
     return all_materials
 
-# =================== TEXT PARSING HELPERS ===================
-def normalize_material_text(text):
-    """Normalize text while preserving numbers and units."""
+# =================== TEXT PARSING ===================
+def normalize_text(text):
     text = text.lower()
     text = text.replace("”", '"').replace("“", '"').replace("–", "-").replace("—", "-")
     text = text.replace("inch", "in").replace("in.", "in").replace('"', 'in')
-    # Remove only irrelevant words, keep numbers + units
     text = re.sub(r'\b(roll|bag|pcs?|each|ea|unit|piece|per|of)\b', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
@@ -126,11 +121,10 @@ def expand_synonyms(text):
             text = re.sub(r'\b' + re.escape(key) + r'\b', val, text)
     return text
 
-def parse_materials_text(text):
-    """Parse raw text into structured materials with quantity and description."""
+def parse_material_lines(text):
     materials = []
-    for raw_line in text.strip().splitlines():
-        line = raw_line.strip()
+    for line in text.strip().splitlines():
+        line = line.strip()
         if not line:
             continue
         match = re.match(r"^(\d+)\s*[-xX]?\s*(.+)$", line)
@@ -139,35 +133,29 @@ def parse_materials_text(text):
         materials.append({"quantity": qty, "description": desc})
     return materials
 
-def extract_numbers_with_units(text):
-    """Extract numbers with optional units (e.g., 6in, 15ft)."""
+def extract_numbers(text):
     return re.findall(r'\d+\s*(in|ft)?', text.lower())
 
 # =================== MATERIAL MATCHING ===================
-def match_material(description, materials):
-    """Fuzzy match with numeric + unit awareness and synonyms."""
-    desc_expanded = expand_synonyms(description)
-    desc_norm = normalize_material_text(desc_expanded)
-    desc_numbers = extract_numbers_with_units(description)
+def match_material(desc, materials):
+    desc_exp = expand_synonyms(desc)
+    desc_norm = normalize_text(desc_exp)
+    desc_nums = extract_numbers(desc)
 
     best = {"id": None, "name": None, "score": 0}
-
     for m in materials:
         for field in [m.get("displayName", ""), m.get("description", ""), m.get("code", "")]:
             if not field:
                 continue
-            field_expanded = expand_synonyms(field)
-            field_norm = normalize_material_text(field_expanded)
+            field_norm = normalize_text(expand_synonyms(field))
             score = max(fuzz.token_sort_ratio(desc_norm, field_norm),
                         fuzz.partial_ratio(desc_norm, field_norm)) / 100.0
 
-            field_numbers = extract_numbers_with_units(field)
-            # Boost score for numeric + unit matches
-            for dn in desc_numbers:
-                if dn in field_numbers:
+            field_nums = extract_numbers(field)
+            for dn in desc_nums:
+                if dn in field_nums:
                     score += 0.25
-            # Penalize if numeric mismatch
-            if desc_numbers and not any(dn in field_numbers for dn in desc_numbers):
+            if desc_nums and not any(dn in field_nums for dn in desc_nums):
                 score -= 0.1
 
             score = min(max(score, 0), 1.0)
@@ -176,113 +164,99 @@ def match_material(description, materials):
 
     return (best["id"], best["name"], best["score"]) if best["score"] > 0.6 else (None, None, 0)
 
-# =================== SERVICE TITAN OPERATIONS ===================
-def get_invoice_id_from_job(job_id):
+# =================== SERVICE TITAN HELPERS ===================
+def get_invoice_id(job_id):
     url = f"https://api-integration.servicetitan.io/jpm/v2/tenant/{SERVICETITAN_TENANT_ID}/jobs/{job_id}"
     headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY}
-    response = requests.get(url, headers=headers)
-    if response.status_code == 401:
-        fetch_new_token()
+    resp = requests.get(url, headers=headers)
+    if resp.status_code == 401:
+        fetch_token()
         headers["Authorization"] = get_token()
-        response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        job = response.json()
+        resp = requests.get(url, headers=headers)
+    if resp.status_code == 200:
+        job = resp.json()
         invoices = job.get("invoices", [])
         if invoices:
             return invoices[0].get("id")
         return job.get("invoice", {}).get("id")
-    print(f"❌ Failed to get job {job_id}: {response.status_code}")
+    print(f"❌ Failed to get job {job_id}: {resp.status_code}")
     return None
 
-def add_materials_to_invoice(invoice_id, materials):
+def add_to_invoice(invoice_id, items):
     url = f"https://api-integration.servicetitan.io/sales/v2/tenant/{SERVICETITAN_TENANT_ID}/invoices/{invoice_id}"
     headers = {
         "Authorization": get_token(),
         "ST-App-Key": SERVICETITAN_APP_KEY,
         "Content-Type": "application/json"
     }
-    payload = {"items": [
-        {"skuId": m["skuId"], "quantity": m["quantity"], "description": m["description"]}
-        for m in materials
-    ]}
-    response = requests.patch(url, headers=headers, json=payload)
-    if response.status_code == 401:
-        fetch_new_token()
+    payload = {"items": items}
+    resp = requests.patch(url, headers=headers, json=payload)
+    if resp.status_code == 401:
+        fetch_token()
         headers["Authorization"] = get_token()
-        response = requests.patch(url, headers=headers, json=payload)
-    if 200 <= response.status_code < 300:
-        print(f"✅ Added {len(materials)} materials to invoice {invoice_id}")
+        resp = requests.patch(url, headers=headers, json=payload)
+    if 200 <= resp.status_code < 300:
+        print(f"✅ Added {len(items)} items to invoice {invoice_id}")
         return True
-    print(f"❌ Failed to add materials: {response.status_code} {response.text}")
+    print(f"❌ Failed to add materials: {resp.status_code} {resp.text}")
     return False
 
 # =================== FLASK ENDPOINT ===================
 @app.route("/poll", methods=["GET", "POST"])
-def poll_endpoint():
+def poll():
     secret = request.args.get("secret")
     if secret != POLL_SECRET:
         return jsonify({"error": "Unauthorized"}), 401
 
-    print("🔍 Poll triggered (fetching last form submission)")
+    print("🔍 Poll triggered")
     try:
-        url = f"https://api-integration.servicetitan.io/forms/v2/tenant/{SERVICETITAN_TENANT_ID}/submissions"
         headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY}
+        url = f"https://api-integration.servicetitan.io/forms/v2/tenant/{SERVICETITAN_TENANT_ID}/submissions"
         params = {
             "page": 1,
             "pageSize": 1,
             "modifiedOnOrAfter": (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
         }
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code == 401:
-            fetch_new_token()
+        resp = requests.get(url, headers=headers, params=params)
+        if resp.status_code == 401:
+            fetch_token()
             headers["Authorization"] = get_token()
-            response = requests.get(url, headers=headers, params=params)
-        if response.status_code != 200:
-            print(f"❌ Failed to fetch forms: {response.status_code}")
+            resp = requests.get(url, headers=headers, params=params)
+        if resp.status_code != 200:
             return jsonify({"status": "error"}), 500
 
-        data = response.json().get("data", [])
-        if not data:
-            print("📄 No forms found")
+        forms = resp.json().get("data", [])
+        if not forms:
             return jsonify({"status": "success", "message": "No forms found"}), 200
 
-        form = data[0]
-        form_id = form.get("id")
+        form = forms[0]
         job_id = next((o.get("id") for o in form.get("owners", []) if o.get("type") == "Job"), None)
-        print(f"\n➡️ Most recent Form ID: {form_id}")
-        print(f"   Linked Job ID: {job_id}")
 
         materials_text = next(
             (u.get("value") for u in form.get("units", []) if u.get("name") and "materials used" in u.get("name").lower()),
             None
         )
         if not materials_text:
-            print("⚠️ No 'materials used' field found")
             return jsonify({"status": "success", "message": "No materials field"}), 200
 
-        print(f"   Materials Used:\n{materials_text}")
-
-        materials_data = fetch_materials_pricebook()
-        parsed_materials = parse_materials_text(materials_text)
+        materials_data = fetch_materials()
+        parsed_materials = parse_material_lines(materials_text)
         invoice_items = []
         for m in parsed_materials:
             sku_id, name, score = match_material(m["description"], materials_data)
             if sku_id:
-                print(f"✅ Matched '{m['description']}' → {name} (score {score:.2f})")
                 invoice_items.append({
                     "skuId": sku_id,
                     "quantity": m["quantity"],
                     "description": name
                 })
-            else:
-                print(f"⚠️ Could not match '{m['description']}'")
 
         if job_id and invoice_items:
-            invoice_id = get_invoice_id_from_job(job_id)
+            invoice_id = get_invoice_id(job_id)
             if invoice_id:
-                add_materials_to_invoice(invoice_id, invoice_items)
+                add_to_invoice(invoice_id, invoice_items)
 
-        return jsonify({"status": "success", "form_id": form_id}), 200
+        return jsonify({"status": "success", "form_id": form.get("id")}), 200
 
     except Exception as e:
         print(f"❌ Polling failed: {e}")
@@ -290,5 +264,5 @@ def poll_endpoint():
 
 # =================== APP START ===================
 if __name__ == "__main__":
-    load_token_from_file()
+    load_token()
     app.run(host="0.0.0.0", port=5000)
