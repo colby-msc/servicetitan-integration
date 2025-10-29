@@ -15,7 +15,6 @@ SERVICETITAN_APP_KEY = os.getenv("SERVICETITAN_APP_KEY")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 POLL_SECRET = os.getenv("POLL_SECRET", "my-secret-key")
-
 TOKEN_FILE = "token_cache.json"
 
 # =================== GLOBAL STATE ===================
@@ -101,14 +100,21 @@ def fetch_materials_pricebook():
         items = data.get("data", [])
         if not items:
             break
-        all_materials.extend(items)
+        # Store only essential fields to reduce memory
+        for item in items:
+            all_materials.append({
+                "id": item.get("id"),
+                "displayName": item.get("displayName"),
+                "description": item.get("description"),
+                "code": item.get("code"),
+            })
         if not data.get("hasMore", False):
             break
         page += 1
 
     materials_cache["data"] = all_materials
     materials_cache["last_updated"] = time.time()
-    print(f"✅ Cached {len(all_materials)} materials")
+    print(f"✅ Cached {len(all_materials)} materials (essential fields only)")
     return all_materials
 
 # =================== TEXT PARSING HELPERS ===================
@@ -117,68 +123,46 @@ def normalize_material_text(text):
     text = text.replace("”", '"').replace("“", '"').replace("–", "-").replace("—", "-")
     text = text.replace("inch", "in").replace("in.", "in").replace('"', 'in')
     text = text.replace("feet", "ft").replace("ft.", "ft")
-    # remove some common noise words but keep numeric units like '15ft'
     text = re.sub(r'\b(roll|bag|pcs?|each|ea|unit|piece|per)\b', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 def expand_synonyms(text):
-    """Replace keywords with synonyms using regex for whole words."""
     if not text:
         return text
-    out = text
     for key, vals in SYNONYMS.items():
         pattern = r'\b' + re.escape(key) + r'\b'
-        out = re.sub(pattern, vals[0], out, flags=re.IGNORECASE)
-    return out
+        text = re.sub(pattern, vals[0], text, flags=re.IGNORECASE)
+    return text
 
 def parse_materials_text(text):
-    """
-    Improved parsing:
-    - Recognize explicit counts like '1 x 17ft ...' -> qty=1, desc='17ft ...'
-    - Recognize leading length/size like '15ft of ...' -> qty=1, desc='15ft ...'
-    - Fallback -> qty=1, desc=line
-    """
     materials = []
     if not text:
         return materials
-
-    for raw_line in text.strip().splitlines():
-        line = raw_line.strip()
+    for line in text.strip().splitlines():
+        line = line.strip()
         if not line:
             continue
-
-        # 1) explicit count patterns: "1 x 17ft ...", "2- 6in elbow", "3 x something"
+        # explicit count
         m = re.match(r"^(\d+)\s*[-xX]\s*(.+)$", line)
         if m:
             qty = int(m.group(1))
             desc = m.group(2).strip()
             materials.append({"quantity": qty, "description": desc})
             continue
-
-        # 2) leading size/length: "15ft of ...", "6in something", '6" flex'
+        # leading size/length
         m2 = re.match(r"^(\d+(?:\.\d+)?)(\s*(in|ft|\"|inch|inches|feet)\b)(.*)$", line, flags=re.IGNORECASE)
         if m2:
-            qty = 1
             size_token = (m2.group(1) + m2.group(2)).strip()
             remainder = m2.group(4).strip()
-            if remainder:
-                desc = f"{size_token} {remainder}"
-            else:
-                desc = size_token
-            materials.append({"quantity": qty, "description": desc})
+            desc = f"{size_token} {remainder}" if remainder else size_token
+            materials.append({"quantity": 1, "description": desc})
             continue
-
-        # 3) fallback: single item, full line is description
+        # fallback
         materials.append({"quantity": 1, "description": line})
-
     return materials
 
 def extract_numbers_with_units(text):
-    """
-    Extracts normalized number+unit tokens from text:
-    e.g. ["17ft", "6in", "10in", "90"]
-    """
     if not text:
         return []
     t = text.lower().replace('"', 'in')
@@ -189,103 +173,38 @@ def extract_numbers_with_units(text):
             unit = unit.replace('inches', 'in').replace('inch', 'in').replace('feet', 'ft')
             results.append(f"{num}{unit}")
         else:
-            # include plain numbers like 90 (useful for 90-degree elbows)
             results.append(num)
     return results
 
 # =================== MATERIAL MATCHING ===================
 def match_material(description, materials):
-    """Improved matcher with numeric proximity and HVAC category weighting."""
-    desc_expanded = expand_synonyms(description)
-    desc_norm = normalize_material_text(desc_expanded)
+    desc_norm = normalize_material_text(expand_synonyms(description))
     desc_numbers = extract_numbers_with_units(desc_norm)
+    keywords = ["flex", "elbow", "wrap", "tape"]
 
-    categories = {
-        "flex": ["flex", "flexible", "duct"],
-        "elbow": ["elbow", "90"],
-        "wrap": ["wrap", "insulation"],
-        "tape": ["tape", "foil"],
-    }
-    desc_tokens = set(desc_norm.split())
-    desc_category = {cat for cat, keys in categories.items() if any(k in desc_tokens for k in keys)}
-
-    def numeric_proximity_score(desc_nums, field_nums):
-        """Returns closeness score between numeric values (e.g. 17 vs 25 = 0.68)."""
-        score = 0
-        for dn in desc_nums:
-            try:
-                dn_val = float("".join([c for c in dn if c.isdigit() or c == "."]))
-            except:
-                continue
-            for fn in field_nums:
-                try:
-                    fn_val = float("".join([c for c in fn if c.isdigit() or c == "."]))
-                    ratio = min(dn_val, fn_val) / max(dn_val, fn_val)
-                    score = max(score, ratio)
-                except:
-                    continue
-        return score * 0.2  # weight up to +0.2
-
-    scored_matches = []
-
+    # filter materials by numbers or keywords to reduce memory
+    filtered = []
     for m in materials:
-        name = m.get("displayName", "")
-        code = m.get("code", "")
-        desc = m.get("description", "")
-        fields = [name, code, desc]
+        text = " ".join(filter(None, [m.get("displayName"), m.get("description"), m.get("code")])).lower()
+        if any(k in text for k in keywords) or any(n in text for n in desc_numbers):
+            filtered.append(m)
 
-        best_field_score = 0
-        for field in fields:
-            if not field:
-                continue
-            field_expanded = expand_synonyms(field)
-            field_norm = normalize_material_text(field_expanded)
+    best_score = 0
+    best_material = None
+    for m in filtered:
+        for field in [m.get("displayName") or "", m.get("description") or "", m.get("code") or ""]:
+            field_norm = normalize_material_text(expand_synonyms(field))
+            score = fuzz.partial_ratio(desc_norm, field_norm) / 100.0
+            # numeric bonus
             field_numbers = extract_numbers_with_units(field_norm)
-            field_tokens = set(field_norm.split())
-
-            # 1️⃣ Fuzzy text similarity
-            fuzzy_score = max(
-                fuzz.partial_ratio(desc_norm, field_norm),
-                fuzz.token_sort_ratio(desc_norm, field_norm)
-            ) / 100.0
-
-            # 2️⃣ Numeric + proximity scoring
-            numeric_matches = sum(dn == fn for dn in desc_numbers for fn in field_numbers)
-            numeric_partial = sum(dn in fn or fn in dn for dn in desc_numbers for fn in field_numbers)
-            proximity_score = numeric_proximity_score(desc_numbers, field_numbers)
-            numeric_score = 0.10 * numeric_matches + 0.05 * numeric_partial + proximity_score
-
-            # 3️⃣ Semantic weighting
-            semantic_score = 0.0
-            for cat, keys in categories.items():
-                if cat in desc_category and any(k in field_tokens for k in keys):
-                    semantic_score += 0.6  # stronger boost
-                elif cat in desc_category and any(bad in field_tokens for bad in ["wire", "breaker", "motor", "circuit"]):
-                    semantic_score -= 0.3
-
-            total_score = 0.50 * fuzzy_score + 0.25 * semantic_score + 0.20 * numeric_score
-            total_score = min(total_score, 1.0)
-
-            best_field_score = max(best_field_score, total_score)
-
-        if best_field_score > 0:
-            scored_matches.append({
-                "id": m["id"],
-                "name": name,
-                "score": best_field_score
-            })
-
-    scored_matches.sort(key=lambda x: x["score"], reverse=True)
-    top_matches = scored_matches[:3]
-
-    print(f"\n🔎 Debug matches for '{description}':")
-    for i, t in enumerate(top_matches, start=1):
-        print(f"   {i}. {t['name']} (score {t['score']:.2f})")
-
-    best = top_matches[0] if top_matches else {"id": None, "name": None, "score": 0}
-    return (best["id"], best["name"], best["score"]) if best["score"] >= 0.55 else (None, None, 0)
-
-
+            numeric_bonus = sum(0.1 if dn == fn else 0.05 for dn in desc_numbers for fn in field_numbers if dn in fn or fn in dn)
+            score = min(score + numeric_bonus, 1.0)
+            if score > best_score:
+                best_score = score
+                best_material = m
+    if best_score >= 0.55 and best_material:
+        return best_material["id"], best_material["displayName"], best_score
+    return None, None, 0
 
 # =================== SERVICE TITAN OPERATIONS ===================
 def get_invoice_id_from_job(job_id):
@@ -307,15 +226,8 @@ def get_invoice_id_from_job(job_id):
 
 def add_materials_to_invoice(invoice_id, materials):
     url = f"https://api-integration.servicetitan.io/sales/v2/tenant/{SERVICETITAN_TENANT_ID}/invoices/{invoice_id}"
-    headers = {
-        "Authorization": get_token(),
-        "ST-App-Key": SERVICETITAN_APP_KEY,
-        "Content-Type": "application/json"
-    }
-    payload = {"items": [
-        {"skuId": m["skuId"], "quantity": m["quantity"], "description": m["description"]}
-        for m in materials
-    ]}
+    headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY, "Content-Type": "application/json"}
+    payload = {"items": [{"skuId": m["skuId"], "quantity": m["quantity"], "description": m["description"]} for m in materials]}
     response = requests.patch(url, headers=headers, json=payload)
     if response.status_code == 401:
         fetch_new_token()
@@ -338,11 +250,7 @@ def poll_endpoint():
     try:
         url = f"https://api-integration.servicetitan.io/forms/v2/tenant/{SERVICETITAN_TENANT_ID}/submissions"
         headers = {"Authorization": get_token(), "ST-App-Key": SERVICETITAN_APP_KEY}
-        params = {
-            "page": 1,
-            "pageSize": 1,
-            "modifiedOnOrAfter": (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        }
+        params = {"page": 1, "pageSize": 1, "modifiedOnOrAfter": (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")}
         response = requests.get(url, headers=headers, params=params)
         if response.status_code == 401:
             fetch_new_token()
@@ -360,19 +268,14 @@ def poll_endpoint():
         form = data[0]
         form_id = form.get("id")
         job_id = next((o.get("id") for o in form.get("owners", []) if o.get("type") == "Job"), None)
-        print(f"\n➡️ Most recent Form ID: {form_id}")
-        print(f"   Linked Job ID: {job_id}")
+        print(f"\n➡️ Most recent Form ID: {form_id}\n   Linked Job ID: {job_id}")
 
-        materials_text = next(
-            (u.get("value") for u in form.get("units", []) if u.get("name") and "materials used" in u.get("name").lower()),
-            None
-        )
+        materials_text = next((u.get("value") for u in form.get("units", []) if u.get("name") and "materials used" in u.get("name").lower()), None)
         if not materials_text:
             print("⚠️ No 'materials used' field found")
             return jsonify({"status": "success", "message": "No materials field"}), 200
 
         print(f"   Materials Used:\n{materials_text}")
-
         materials_data = fetch_materials_pricebook()
         parsed_materials = parse_materials_text(materials_text)
         invoice_items = []
@@ -380,11 +283,7 @@ def poll_endpoint():
             sku_id, name, score = match_material(m["description"], materials_data)
             if sku_id:
                 print(f"✅ Matched '{m['description']}' → {name} (score {score:.2f})")
-                invoice_items.append({
-                    "skuId": sku_id,
-                    "quantity": m["quantity"],
-                    "description": name
-                })
+                invoice_items.append({"skuId": sku_id, "quantity": m["quantity"], "description": name})
             else:
                 print(f"⚠️ Could not match '{m['description']}'")
 
@@ -394,7 +293,6 @@ def poll_endpoint():
                 add_materials_to_invoice(invoice_id, invoice_items)
 
         return jsonify({"status": "success", "form_id": form_id}), 200
-
     except Exception as e:
         print(f"❌ Polling failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
