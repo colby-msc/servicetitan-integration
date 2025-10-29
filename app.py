@@ -195,7 +195,7 @@ def extract_numbers_with_units(text):
 
 # =================== MATERIAL MATCHING ===================
 def match_material(description, materials):
-    """Tuned AI-style matcher for HVAC materials."""
+    """Improved matcher with numeric proximity and HVAC category weighting."""
     desc_expanded = expand_synonyms(description)
     desc_norm = normalize_material_text(desc_expanded)
     desc_numbers = extract_numbers_with_units(desc_norm)
@@ -208,6 +208,23 @@ def match_material(description, materials):
     }
     desc_tokens = set(desc_norm.split())
     desc_category = {cat for cat, keys in categories.items() if any(k in desc_tokens for k in keys)}
+
+    def numeric_proximity_score(desc_nums, field_nums):
+        """Returns closeness score between numeric values (e.g. 17 vs 25 = 0.68)."""
+        score = 0
+        for dn in desc_nums:
+            try:
+                dn_val = float("".join([c for c in dn if c.isdigit() or c == "."]))
+            except:
+                continue
+            for fn in field_nums:
+                try:
+                    fn_val = float("".join([c for c in fn if c.isdigit() or c == "."]))
+                    ratio = min(dn_val, fn_val) / max(dn_val, fn_val)
+                    score = max(score, ratio)
+                except:
+                    continue
+        return score * 0.2  # weight up to +0.2
 
     scored_matches = []
 
@@ -232,21 +249,21 @@ def match_material(description, materials):
                 fuzz.token_sort_ratio(desc_norm, field_norm)
             ) / 100.0
 
-            # 2️⃣ Numeric matching
+            # 2️⃣ Numeric + proximity scoring
             numeric_matches = sum(dn == fn for dn in desc_numbers for fn in field_numbers)
             numeric_partial = sum(dn in fn or fn in dn for dn in desc_numbers for fn in field_numbers)
-            numeric_score = 0.15 * numeric_matches + 0.05 * numeric_partial
+            proximity_score = numeric_proximity_score(desc_numbers, field_numbers)
+            numeric_score = 0.10 * numeric_matches + 0.05 * numeric_partial + proximity_score
 
-            # 3️⃣ Semantic category weighting
+            # 3️⃣ Semantic weighting
             semantic_score = 0.0
             for cat, keys in categories.items():
                 if cat in desc_category and any(k in field_tokens for k in keys):
-                    semantic_score += 0.4
+                    semantic_score += 0.6  # stronger boost
                 elif cat in desc_category and any(bad in field_tokens for bad in ["wire", "breaker", "motor", "circuit"]):
                     semantic_score -= 0.3
 
-            # 4️⃣ Combine
-            total_score = 0.55 * fuzzy_score + 0.25 * semantic_score + 0.15 * numeric_score
+            total_score = 0.50 * fuzzy_score + 0.25 * semantic_score + 0.20 * numeric_score
             total_score = min(total_score, 1.0)
 
             best_field_score = max(best_field_score, total_score)
@@ -258,7 +275,6 @@ def match_material(description, materials):
                 "score": best_field_score
             })
 
-    # Sort & debug
     scored_matches.sort(key=lambda x: x["score"], reverse=True)
     top_matches = scored_matches[:3]
 
@@ -267,8 +283,8 @@ def match_material(description, materials):
         print(f"   {i}. {t['name']} (score {t['score']:.2f})")
 
     best = top_matches[0] if top_matches else {"id": None, "name": None, "score": 0}
-    # lowered threshold slightly from 0.65 → 0.60
-    return (best["id"], best["name"], best["score"]) if best["score"] >= 0.60 else (None, None, 0)
+    return (best["id"], best["name"], best["score"]) if best["score"] >= 0.55 else (None, None, 0)
+
 
 
 # =================== SERVICE TITAN OPERATIONS ===================
