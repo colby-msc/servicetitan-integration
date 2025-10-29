@@ -195,67 +195,80 @@ def extract_numbers_with_units(text):
 
 # =================== MATERIAL MATCHING ===================
 def match_material(description, materials):
-    """
-    Numeric-first enhanced matcher:
-    - Normalize & expand synonyms
-    - Try strong numeric/size exact-match boost
-    - Then weighted fuzzy + token bonuses
-    - Higher threshold to avoid spurious exact fuzzy picks
-    """
-    if not description:
-        return (None, None, 0)
-
+    """Hybrid AI-style matcher with semantic bias + debug output."""
     desc_expanded = expand_synonyms(description)
     desc_norm = normalize_material_text(desc_expanded)
     desc_numbers = extract_numbers_with_units(desc_norm)
 
-    best = {"id": None, "name": None, "score": 0}
+    # Category keyword tags
+    categories = {
+        "flex": ["flex", "flexible"],
+        "elbow": ["elbow", "90"],
+        "wrap": ["wrap", "insulation"],
+        "tape": ["tape", "foil"],
+    }
+    desc_tokens = set(desc_norm.split())
+    desc_category = {cat for cat, keys in categories.items() if any(k in desc_tokens for k in keys)}
+
+    scored_matches = []
 
     for m in materials:
-        name = m.get("displayName", "") or ""
-        code = m.get("code", "") or ""
-        info = m.get("description", "") or ""
-        fields = [name, code, info]
+        name = m.get("displayName", "")
+        code = m.get("code", "")
+        desc = m.get("description", "")
+        fields = [name, code, desc]
 
+        best_field_score = 0
         for field in fields:
             if not field:
                 continue
             field_expanded = expand_synonyms(field)
             field_norm = normalize_material_text(field_expanded)
             field_numbers = extract_numbers_with_units(field_norm)
+            field_tokens = set(field_norm.split())
 
-            # 1) numeric exact match: any exact token match -> base score
-            numeric_exact = any(dn == fn for dn in desc_numbers for fn in field_numbers)
-            if numeric_exact:
-                base_score = 0.6
-            else:
-                base_score = 0.0
-
-            # 2) fuzzy similarity (secondary, scaled)
+            # 1️⃣ Fuzzy similarity
             fuzzy_score = max(
                 fuzz.partial_ratio(desc_norm, field_norm),
                 fuzz.token_sort_ratio(desc_norm, field_norm)
             ) / 100.0
 
-            score = base_score + fuzzy_score * 0.6  # fuzzy contributes but less than exact numeric
+            # 2️⃣ Numeric matching
+            numeric_matches = sum(dn == fn for dn in desc_numbers for fn in field_numbers)
+            numeric_score = 0.1 * numeric_matches
 
-            # 3) domain token bonuses
-            for token, bonus in [("flex", 0.12), ("elbow", 0.12), ("wrap", 0.10), ("tape", 0.10), ("boot", 0.05)]:
-                if token in desc_norm and token in field_norm:
-                    score += bonus
+            # 3️⃣ Semantic category weighting
+            semantic_score = 0.0
+            for cat, keys in categories.items():
+                if cat in desc_category and any(k in field_tokens for k in keys):
+                    semantic_score += 0.4
+                elif cat in desc_category and any(bad in field_tokens for bad in ["wire", "breaker", "motor"]):
+                    semantic_score -= 0.3  # penalize wrong type
 
-            # penalty if description includes numbers but field doesn't
-            if desc_numbers and not field_numbers:
-                score -= 0.12
+            # 4️⃣ Combine
+            total_score = 0.6 * fuzzy_score + 0.2 * semantic_score + 0.15 * numeric_score
+            total_score = min(total_score, 1.0)
 
-            # clamp to [0,1]
-            score = min(max(score, 0.0), 1.0)
+            best_field_score = max(best_field_score, total_score)
 
-            if score > best["score"]:
-                best = {"id": m.get("id"), "name": name, "score": score}
+        if best_field_score > 0:
+            scored_matches.append({
+                "id": m["id"],
+                "name": name,
+                "score": best_field_score
+            })
 
-    # higher threshold to reduce false positives
-    return (best["id"], best["name"], best["score"]) if best["score"] >= 0.70 else (None, None, 0)
+    # Sort and log top matches
+    scored_matches.sort(key=lambda x: x["score"], reverse=True)
+    top_matches = scored_matches[:3]
+
+    print(f"\n🔎 Debug matches for '{description}':")
+    for i, t in enumerate(top_matches, start=1):
+        print(f"   {i}. {t['name']} (score {t['score']:.2f})")
+
+    best = top_matches[0] if top_matches else {"id": None, "name": None, "score": 0}
+    return (best["id"], best["name"], best["score"]) if best["score"] >= 0.65 else (None, None, 0)
+
 
 # =================== SERVICE TITAN OPERATIONS ===================
 def get_invoice_id_from_job(job_id):
