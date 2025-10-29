@@ -24,10 +24,12 @@ materials_cache = {"data": [], "last_updated": 0, "cache_duration": 3600}
 
 # =================== SYNONYMS ===================
 SYNONYMS = {
-    "flex": ["duct", "flexible duct"],
+    "flex": ["flex duct", "flexible duct"],
     "silvertape": ["foil tape", "silver tape"],
-    "insulation wrap": ["duct insulation", "duct wrap"],
-    "elbow": ["pipe elbow", "hard pipe elbow"]
+    "insulation wrap": ["duct wrap", "duct insulation"],
+    "wrap": ["duct wrap"],
+    "90": ["elbow", "90 degree", "90°"],
+    "elbow": ["90", "elbow fitting"],
 }
 
 # =================== TOKEN MANAGEMENT ===================
@@ -123,7 +125,6 @@ def expand_synonyms(text):
     """Replace keywords with synonyms using regex for whole words."""
     for key, vals in SYNONYMS.items():
         pattern = r'\b' + re.escape(key) + r'\b'
-        # replace with first synonym (or could use all options if needed)
         text = re.sub(pattern, vals[0], text)
     return text
 
@@ -140,16 +141,20 @@ def parse_materials_text(text):
     return materials
 
 def extract_numbers_with_units(text):
-    """Extract numbers with units like 6in, 6 in, 6", 15ft, etc."""
-    text = text.lower()
-    matches = re.findall(r'(\d+(?:\.\d+)?)\s*(in|ft|")?', text)
-    # normalize " and inch to in
-    normalized = [f"{num}in" if unit in ('"', 'in') else f"{num}ft" if unit == 'ft' else num for num, unit in matches]
-    return normalized
+    """Extract numeric-unit pairs like 6in, 25ft, 10in, 90, etc."""
+    text = text.lower().replace('"', 'in')
+    matches = re.findall(r'(\d+(?:\.\d+)?)\s*(in|ft)?', text)
+    results = []
+    for num, unit in matches:
+        if unit:
+            results.append(f"{num}{unit}")
+        else:
+            results.append(num)
+    return results
 
 # =================== MATERIAL MATCHING ===================
 def match_material(description, materials):
-    """Fuzzy match with numeric/unit awareness and synonyms."""
+    """Improved material matcher with weighted numeric + fuzzy logic."""
     desc_expanded = expand_synonyms(description)
     desc_norm = normalize_material_text(desc_expanded)
     desc_numbers = extract_numbers_with_units(desc_norm)
@@ -157,27 +162,43 @@ def match_material(description, materials):
     best = {"id": None, "name": None, "score": 0}
 
     for m in materials:
-        fields = [m.get("displayName", ""), m.get("description", ""), m.get("code", "")]
+        name = m.get("displayName", "")
+        code = m.get("code", "")
+        desc = m.get("description", "")
+        fields = [name, code, desc]
+
         for field in fields:
             if not field:
                 continue
             field_expanded = expand_synonyms(field)
             field_norm = normalize_material_text(field_expanded)
-            score = max(fuzz.token_sort_ratio(desc_norm, field_norm),
-                        fuzz.partial_ratio(desc_norm, field_norm)) / 100.0
-
             field_numbers = extract_numbers_with_units(field_norm)
-            numeric_match = any(dn == fn for dn in desc_numbers for fn in field_numbers)
-            if numeric_match:
-                score += 0.25
+
+            fuzzy_score = max(
+                fuzz.partial_ratio(desc_norm, field_norm),
+                fuzz.token_sort_ratio(desc_norm, field_norm)
+            ) / 100.0
+
+            num_matches = sum(dn == fn for dn in desc_numbers for fn in field_numbers)
+            if num_matches:
+                fuzzy_score += 0.35 * num_matches
             elif desc_numbers:
-                score -= 0.1
+                fuzzy_score -= 0.1
 
-            score = min(max(score, 0), 1.0)
-            if score > best["score"]:
-                best = {"id": m["id"], "name": m.get("displayName", ""), "score": score}
+            for token in ["flex", "elbow", "wrap", "tape"]:
+                if token in desc_norm and token in field_norm:
+                    fuzzy_score += 0.15
 
-    return (best["id"], best["name"], best["score"]) if best["score"] > 0.6 else (None, None, 0)
+            fuzzy_score = min(fuzzy_score, 1.0)
+
+            if fuzzy_score > best["score"]:
+                best = {
+                    "id": m["id"],
+                    "name": name,
+                    "score": fuzzy_score
+                }
+
+    return (best["id"], best["name"], best["score"]) if best["score"] >= 0.65 else (None, None, 0)
 
 # =================== SERVICE TITAN OPERATIONS ===================
 def get_invoice_id_from_job(job_id):
