@@ -402,23 +402,62 @@ def poll_endpoint():
         return jsonify({"status": "error", "message": str(e)}), 500
     
 # ==================================================
-@app.route("/test-matching", methods=["POST"])
+@app.route('/test-matching', methods=['POST'])
 def test_matching():
-    data = request.get_json()
-    test_inputs = data.get("materials", [])
-    materials_data = fetch_materials_pricebook()
+    try:
+        # Parse incoming JSON body
+        data = request.get_json()
+        test_inputs = data.get("inputs", [])
+        limit = int(request.args.get("limit", 500))  # limit pricebook size for safety
 
-    results = []
-    for desc in test_inputs:
-        sku_id, name, score = match_material(desc, materials_data)
-        results.append({
-            "input": desc,
-            "matched_name": name,
-            "score": score
+        if not test_inputs:
+            return jsonify({"error": "No inputs provided"}), 400
+
+        print(f"🔍 Starting test-matching with {len(test_inputs)} test items...")
+
+        # Fetch materials and trim for performance
+        all_materials = fetch_materials_pricebook()
+        materials_data = all_materials[:limit] if limit < len(all_materials) else all_materials
+        print(f"✅ Loaded {len(materials_data)} materials (limit={limit})")
+
+        # Process inputs in small chunks (avoids memory spikes)
+        results = []
+        for i, raw_input in enumerate(test_inputs, start=1):
+            print(f"\n🔎 Testing input #{i}: {raw_input}")
+
+            top_matches = match_material(raw_input, materials_data, debug=True)
+            if top_matches:
+                best = top_matches[0]
+                result = {
+                    "input": raw_input,
+                    "matched": best["name"],
+                    "score": round(best["score"], 2),
+                    "debug_top_matches": [
+                        {"name": m["name"], "score": round(m["score"], 2)}
+                        for m in top_matches[:3]
+                    ]
+                }
+                print(f"✅ Matched '{raw_input}' → {best['name']} (score {best['score']:.2f})")
+            else:
+                result = {"input": raw_input, "matched": None, "score": 0}
+                print(f"⚠️ No matches found for '{raw_input}'")
+
+            results.append(result)
+
+            # Stream progress logs for large batches
+            if i % 10 == 0:
+                print(f"🟡 Processed {i}/{len(test_inputs)} items so far...")
+
+        print("✅ Test-matching completed successfully.")
+        return jsonify({
+            "total_inputs": len(test_inputs),
+            "materials_in_pricebook": len(materials_data),
+            "results": results
         })
-    return jsonify(results)
 
-
+    except Exception as e:
+        print(f"❌ Error in /test-matching: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 # =================== APP START ===================
