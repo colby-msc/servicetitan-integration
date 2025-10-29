@@ -398,6 +398,26 @@ def poll_endpoint():
     except Exception as e:
         print(f"❌ Polling failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+    
+# ==================================================
+@app.route("/test-matching", methods=["POST"])
+def test_matching():
+    data = request.get_json()
+    test_inputs = data.get("materials", [])
+    materials_data = fetch_materials_pricebook()
+
+    results = []
+    for desc in test_inputs:
+        sku_id, name, score = match_material(desc, materials_data)
+        results.append({
+            "input": desc,
+            "matched_name": name,
+            "score": score
+        })
+    return jsonify(results)
+
+
+
 
 # =================== APP START ===================
 if __name__ == "__main__":
