@@ -46,8 +46,6 @@ def load_token_from_file():
             if time.time() < data.get("expires_at", 0):
                 token_data.update(data)
                 print("✅ Loaded token from cache")
-            else:
-                print("⚠️ Cached token expired")
         except Exception as e:
             print(f"⚠️ Could not read cached token: {e}")
 
@@ -116,57 +114,63 @@ def normalize_material_text(text):
     """Normalize text while preserving numbers and units."""
     text = text.lower()
     text = text.replace("”", '"').replace("“", '"').replace("–", "-").replace("—", "-")
-    text = text.replace("in.", "in").replace("inch", "in").replace('"', 'in')
-    text = re.sub(r'\b(ft|feet|roll|of|bag|pcs?|each|ea|unit|piece|per)\b', '', text)
+    text = text.replace("inch", "in").replace("in.", "in").replace('"', 'in')
+    # Remove only irrelevant words, keep numbers + units
+    text = re.sub(r'\b(roll|bag|pcs?|each|ea|unit|piece|per|of)\b', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 def expand_synonyms(text):
     for key, vals in SYNONYMS.items():
         for val in vals:
-            text = text.replace(key, val)
+            text = re.sub(r'\b' + re.escape(key) + r'\b', val, text)
     return text
 
 def parse_materials_text(text):
-    """Parses text like '2x 6in flex' or '1- silvertape'."""
+    """Parse raw text into structured materials with quantity and description."""
     materials = []
     for raw_line in text.strip().splitlines():
         line = raw_line.strip()
         if not line:
             continue
         match = re.match(r"^(\d+)\s*[-xX]?\s*(.+)$", line)
-        if match:
-            qty = int(match.group(1))
-            desc = match.group(2).strip()
-        else:
-            qty = 1
-            desc = line
+        qty = int(match.group(1)) if match else 1
+        desc = match.group(2).strip() if match else line
         materials.append({"quantity": qty, "description": desc})
     return materials
 
+def extract_numbers_with_units(text):
+    """Extract numbers with optional units (e.g., 6in, 15ft)."""
+    return re.findall(r'\d+\s*(in|ft)?', text.lower())
+
 # =================== MATERIAL MATCHING ===================
 def match_material(description, materials):
-    """Fuzzy match with numeric boosting and synonyms."""
-    desc_norm = normalize_material_text(expand_synonyms(description))
-    desc_numbers = re.findall(r'\d+\s*(in|ft)?', desc_norm)
+    """Fuzzy match with numeric + unit awareness and synonyms."""
+    desc_expanded = expand_synonyms(description)
+    desc_norm = normalize_material_text(desc_expanded)
+    desc_numbers = extract_numbers_with_units(description)
+
     best = {"id": None, "name": None, "score": 0}
 
     for m in materials:
         for field in [m.get("displayName", ""), m.get("description", ""), m.get("code", "")]:
             if not field:
                 continue
-            field_norm = normalize_material_text(expand_synonyms(field))
-            score = max(
-                fuzz.token_sort_ratio(desc_norm, field_norm),
-                fuzz.partial_ratio(desc_norm, field_norm)
-            ) / 100.0
+            field_expanded = expand_synonyms(field)
+            field_norm = normalize_material_text(field_expanded)
+            score = max(fuzz.token_sort_ratio(desc_norm, field_norm),
+                        fuzz.partial_ratio(desc_norm, field_norm)) / 100.0
 
-            field_numbers = re.findall(r'\d+\s*(in|ft)?', field_norm)
+            field_numbers = extract_numbers_with_units(field)
+            # Boost score for numeric + unit matches
             for dn in desc_numbers:
                 if dn in field_numbers:
-                    score += 0.15
+                    score += 0.25
+            # Penalize if numeric mismatch
+            if desc_numbers and not any(dn in field_numbers for dn in desc_numbers):
+                score -= 0.1
 
-            score = min(score, 1.0)
+            score = min(max(score, 0), 1.0)
             if score > best["score"]:
                 best = {"id": m["id"], "name": m.get("displayName", ""), "score": score}
 
