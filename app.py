@@ -113,48 +113,98 @@ def fetch_materials_pricebook():
 
 # =================== TEXT PARSING HELPERS ===================
 def normalize_material_text(text):
-    text = text.lower()
+    text = (text or "").lower()
     text = text.replace("”", '"').replace("“", '"').replace("–", "-").replace("—", "-")
     text = text.replace("inch", "in").replace("in.", "in").replace('"', 'in')
     text = text.replace("feet", "ft").replace("ft.", "ft")
-    text = re.sub(r'\b(roll|bag|pcs?|each|ea|unit|piece|per|of)\b', '', text)
+    # remove some common noise words but keep numeric units like '15ft'
+    text = re.sub(r'\b(roll|bag|pcs?|each|ea|unit|piece|per)\b', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 def expand_synonyms(text):
     """Replace keywords with synonyms using regex for whole words."""
+    if not text:
+        return text
+    out = text
     for key, vals in SYNONYMS.items():
         pattern = r'\b' + re.escape(key) + r'\b'
-        text = re.sub(pattern, vals[0], text)
-    return text
+        out = re.sub(pattern, vals[0], out, flags=re.IGNORECASE)
+    return out
 
 def parse_materials_text(text):
+    """
+    Improved parsing:
+    - Recognize explicit counts like '1 x 17ft ...' -> qty=1, desc='17ft ...'
+    - Recognize leading length/size like '15ft of ...' -> qty=1, desc='15ft ...'
+    - Fallback -> qty=1, desc=line
+    """
     materials = []
+    if not text:
+        return materials
+
     for raw_line in text.strip().splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        match = re.match(r"^(\d+)\s*[-xX]?\s*(.+)$", line)
-        qty = int(match.group(1)) if match else 1
-        desc = match.group(2).strip() if match else line
-        materials.append({"quantity": qty, "description": desc})
+
+        # 1) explicit count patterns: "1 x 17ft ...", "2- 6in elbow", "3 x something"
+        m = re.match(r"^(\d+)\s*[-xX]\s*(.+)$", line)
+        if m:
+            qty = int(m.group(1))
+            desc = m.group(2).strip()
+            materials.append({"quantity": qty, "description": desc})
+            continue
+
+        # 2) leading size/length: "15ft of ...", "6in something", '6" flex'
+        m2 = re.match(r"^(\d+(?:\.\d+)?)(\s*(in|ft|\"|inch|inches|feet)\b)(.*)$", line, flags=re.IGNORECASE)
+        if m2:
+            qty = 1
+            size_token = (m2.group(1) + m2.group(2)).strip()
+            remainder = m2.group(4).strip()
+            if remainder:
+                desc = f"{size_token} {remainder}"
+            else:
+                desc = size_token
+            materials.append({"quantity": qty, "description": desc})
+            continue
+
+        # 3) fallback: single item, full line is description
+        materials.append({"quantity": 1, "description": line})
+
     return materials
 
 def extract_numbers_with_units(text):
-    """Extract numeric-unit pairs like 6in, 25ft, 10in, 90, etc."""
-    text = text.lower().replace('"', 'in')
-    matches = re.findall(r'(\d+(?:\.\d+)?)\s*(in|ft)?', text)
+    """
+    Extracts normalized number+unit tokens from text:
+    e.g. ["17ft", "6in", "10in", "90"]
+    """
+    if not text:
+        return []
+    t = text.lower().replace('"', 'in')
+    matches = re.findall(r'(\d+(?:\.\d+)?)(?:\s*(in|ft|inch|inches|feet))?', t)
     results = []
     for num, unit in matches:
         if unit:
+            unit = unit.replace('inches', 'in').replace('inch', 'in').replace('feet', 'ft')
             results.append(f"{num}{unit}")
         else:
+            # include plain numbers like 90 (useful for 90-degree elbows)
             results.append(num)
     return results
 
 # =================== MATERIAL MATCHING ===================
 def match_material(description, materials):
-    """Improved material matcher with weighted numeric + fuzzy logic."""
+    """
+    Numeric-first enhanced matcher:
+    - Normalize & expand synonyms
+    - Try strong numeric/size exact-match boost
+    - Then weighted fuzzy + token bonuses
+    - Higher threshold to avoid spurious exact fuzzy picks
+    """
+    if not description:
+        return (None, None, 0)
+
     desc_expanded = expand_synonyms(description)
     desc_norm = normalize_material_text(desc_expanded)
     desc_numbers = extract_numbers_with_units(desc_norm)
@@ -162,10 +212,10 @@ def match_material(description, materials):
     best = {"id": None, "name": None, "score": 0}
 
     for m in materials:
-        name = m.get("displayName", "")
-        code = m.get("code", "")
-        desc = m.get("description", "")
-        fields = [name, code, desc]
+        name = m.get("displayName", "") or ""
+        code = m.get("code", "") or ""
+        info = m.get("description", "") or ""
+        fields = [name, code, info]
 
         for field in fields:
             if not field:
@@ -174,31 +224,38 @@ def match_material(description, materials):
             field_norm = normalize_material_text(field_expanded)
             field_numbers = extract_numbers_with_units(field_norm)
 
+            # 1) numeric exact match: any exact token match -> base score
+            numeric_exact = any(dn == fn for dn in desc_numbers for fn in field_numbers)
+            if numeric_exact:
+                base_score = 0.6
+            else:
+                base_score = 0.0
+
+            # 2) fuzzy similarity (secondary, scaled)
             fuzzy_score = max(
                 fuzz.partial_ratio(desc_norm, field_norm),
                 fuzz.token_sort_ratio(desc_norm, field_norm)
             ) / 100.0
 
-            num_matches = sum(dn == fn for dn in desc_numbers for fn in field_numbers)
-            if num_matches:
-                fuzzy_score += 0.35 * num_matches
-            elif desc_numbers:
-                fuzzy_score -= 0.1
+            score = base_score + fuzzy_score * 0.6  # fuzzy contributes but less than exact numeric
 
-            for token in ["flex", "elbow", "wrap", "tape"]:
+            # 3) domain token bonuses
+            for token, bonus in [("flex", 0.12), ("elbow", 0.12), ("wrap", 0.10), ("tape", 0.10), ("boot", 0.05)]:
                 if token in desc_norm and token in field_norm:
-                    fuzzy_score += 0.15
+                    score += bonus
 
-            fuzzy_score = min(fuzzy_score, 1.0)
+            # penalty if description includes numbers but field doesn't
+            if desc_numbers and not field_numbers:
+                score -= 0.12
 
-            if fuzzy_score > best["score"]:
-                best = {
-                    "id": m["id"],
-                    "name": name,
-                    "score": fuzzy_score
-                }
+            # clamp to [0,1]
+            score = min(max(score, 0.0), 1.0)
 
-    return (best["id"], best["name"], best["score"]) if best["score"] >= 0.65 else (None, None, 0)
+            if score > best["score"]:
+                best = {"id": m.get("id"), "name": name, "score": score}
+
+    # higher threshold to reduce false positives
+    return (best["id"], best["name"], best["score"]) if best["score"] >= 0.70 else (None, None, 0)
 
 # =================== SERVICE TITAN OPERATIONS ===================
 def get_invoice_id_from_job(job_id):
